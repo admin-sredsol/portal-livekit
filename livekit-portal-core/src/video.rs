@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! WebRTC media-path video: native publishers (RGB → I420 via libyuv) and
+//! receivers (I420 → RGB). Part of the native transport, gated behind the
+//! crate's `native` cargo feature — this module touches libwebrtc directly
+//! and never compiles for wasm. Frame-video tracks bypass this module
+//! entirely (they ride byte streams in `frame_video.rs`, which is portable).
+
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -37,7 +43,8 @@ use crate::error::{PortalError, PortalResult};
 use crate::metrics::TrackMetrics;
 use crate::portal::ObservationSink;
 use crate::sync_buffer::SyncBuffer;
-use crate::types::VideoFrameData;
+use crate::time::now_us;
+use crate::types::{VideoFrameData, VideoTrackSlots};
 
 const DEFAULT_WIDTH: u32 = 640;
 const DEFAULT_HEIGHT: u32 = 480;
@@ -165,25 +172,6 @@ impl VideoPublisher {
 }
 
 // --- Receiver ---
-
-pub(crate) type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
-
-/// Push callback + latest-wins slot for a single video track, paired so the
-/// receiver task and `get_video_frame` share one allocation.
-pub(crate) struct VideoTrackSlots {
-    pub cb: Mutex<Option<VideoCb>>,
-    pub latest: Mutex<Option<VideoFrameData>>,
-}
-
-impl VideoTrackSlots {
-    pub fn new() -> Self {
-        Self { cb: Mutex::new(None), latest: Mutex::new(None) }
-    }
-
-    pub fn clear(&self) {
-        *self.latest.lock() = None;
-    }
-}
 
 /// Frames buffered between the drain task and the processing task. At 60fps
 /// this is ~130ms of slack, enough to ride out bursts and brief callback
@@ -440,10 +428,6 @@ fn rgb_to_i420(src: &[u8], width: u32, height: u32, buffer: &mut I420Buffer) {
             height as i32,
         );
     }
-}
-
-pub(crate) fn now_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
 }
 
 #[cfg(test)]

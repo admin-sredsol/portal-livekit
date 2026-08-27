@@ -1,0 +1,30 @@
+// Copyright 2026 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Wall-clock helpers shared by the publish and metrics paths.
+
+/// Current time in microseconds since the Unix epoch. Default timestamp for
+/// outgoing state / actions / chunks / frames when the caller doesn't supply
+/// one.
+///
+/// Uses `std::time::SystemTime`, which compiles on `wasm32` but does not
+/// advance there — browsers pass explicit `timestamp_us` values (every send
+/// API takes one) or back the clock via a transport-level shim in a future
+/// wasm entry point.
+pub fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}

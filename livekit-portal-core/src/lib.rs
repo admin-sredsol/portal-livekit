@@ -14,11 +14,23 @@
 
 //! Transport-agnostic core of LiveKit Portal.
 //!
-//! Everything in this crate is free of LiveKit SDK, tokio I/O, and native
-//! (libwebrtc / libyuv) dependencies, so it builds for `wasm32-unknown-unknown`
-//! as well as all native targets. The SDK-facing orchestration lives in the
-//! `livekit-portal` crate, which re-exports these modules so downstream
-//! paths are unchanged.
+//! All of Portal's protocol logic — role setup, state/action publishing,
+//! chunk and frame-video byte streams, RPC routing, the multi-controller
+//! layer, and the sync pipeline — lives here, programmed against the
+//! [`transport::PortalTransport`] trait instead of the LiveKit SDK. The
+//! crate therefore builds for `wasm32-unknown-unknown` as well as all
+//! native targets.
+//!
+//! Two transports implement the seam:
+//!
+//! * `LiveKitRustTransport` ([`native`]), behind the crate's `native`
+//!   cargo feature: the LiveKit Rust SDK (libwebrtc + yuv) for native
+//!   targets.
+//! * A JS-backed transport (Phase 3 of the WASM port): the same Portal
+//!   logic compiled to wasm, driving the LiveKit JS SDK from the browser.
+//!
+//! The `livekit-portal` crate is a thin facade that enables `native` and
+//! re-exports everything, so downstream import paths are unchanged.
 
 pub mod codec;
 pub mod config;
@@ -29,7 +41,22 @@ pub mod metrics;
 pub mod rpc;
 pub mod serialization;
 pub mod sync_buffer;
+pub mod time;
+pub mod transport;
 pub mod types;
+
+// Orchestration + the byte-stream/RTT services. Private modules; their
+// public items are re-exported below.
+mod data;
+mod frame_video;
+pub mod portal;
+mod rtt;
+
+// SDK- and libwebrtc-facing modules, native targets only.
+#[cfg(feature = "native")]
+pub mod native;
+#[cfg(feature = "native")]
+mod video;
 
 pub use codec::Codec;
 pub use config::{
@@ -39,11 +66,21 @@ pub use config::{
 pub use config_file::ConfigFileError;
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
+pub use frame_video::BYTE_STREAM_CHUNK_SIZE;
 pub use metrics::{
     BufferMetrics, PolicyMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics,
 };
+pub use portal::{ACTIVE_OPERATOR_ATTR_KEY, Portal, ROLE_ATTR_KEY, SET_ACTIVE_OPERATOR_RPC};
 pub use rpc::{RpcError, RpcHandler, RpcInvocationData};
+pub use time::now_us;
+pub use transport::{
+    ParticipantInfo, PortalTransport, TransportConnect, TransportEvent, TransportFuture,
+    TransportRpcRequest, VideoReceiverHandle, VideoSink,
+};
 pub use types::{
     Action, ActionChunk, ChunkColumn, Observation, Role, State, SyncConfig, TypedValue,
-    VideoFrameData,
+    VideoFrameData, VideoTrackSlots,
 };
+
+#[cfg(feature = "native")]
+pub use native::LiveKitRustTransport;

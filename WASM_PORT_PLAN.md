@@ -3,6 +3,23 @@
 Assessment of this fork (clean clone of livekit/portal @ `999c118`) for compiling the Rust
 core to WebAssembly and making Portal usable from a browser operator UI.
 
+> **Status (updated after Phase 1).** Phases 0 and 1 are **done**, with one design
+> change from the sketch below: the native `LiveKitRustTransport` lives *inside*
+> `livekit-portal-core` behind a `native` cargo feature (not in the parent crate), and
+> the parent `livekit-portal` crate is now a thin facade that only enables that feature
+> and re-exports core. This keeps `Portal::connect(url, token)` as an inherent method
+> (so `livekit-portal-ffi` is untouched), and makes the future wasm build simply "core
+> with default features". Verified: `cargo check --workspace` (native) clean, 111 core
+> tests pass, clippy clean on lib targets, and
+> `cargo check/build -p livekit-portal-core --target wasm32-unknown-unknown`
+> (default features) clean. Core's tokio is `default-features = false` + `sync,rt`
+> (workspace inheritance can't override default-features, so it's declared directly);
+> the `native` feature adds `tokio/time` plus `livekit`, `yuv-sys`, `futures-util`.
+> Core now also owns `portal.rs` / `data.rs` / `frame_video.rs` / `rtt.rs` /
+> `video.rs` (git mv, history preserved) programmed against `PortalTransport`
+> (`transport.rs`), with `time.rs` (`now_us`, no tokio clock) and the `sleep()`
+> trait method replacing `tokio::time` in core.
+
 ## 1. Verdict
 
 | Question | Answer |

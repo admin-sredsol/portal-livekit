@@ -12,3 +12,28 @@ parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "1"
 thiserror = { workspace = true }
+# Declared directly (not `workspace = true`) because the workspace root's
+# default features pull in tokio's net/fs/process stack, which does not
+# compile on wasm32-unknown-unknown. Core only needs sync (mpsc channels)
+# and rt (tokio::spawn) on every target.
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
+
+# Native-only: the LiveKit Rust SDK (libwebrtc), the yuv colour
+# converter, and the StreamExt used by the video receive loop — linked
+# exclusively behind the `native` feature. The wasm build uses default
+# features and swaps in a JS transport instead — see the module docs in
+# `native.rs` / `video.rs`.
+livekit = { version = "0.8.3", features = ["rustls-tls-native-roots"], optional = true }
+yuv-sys = { version = "0.3.14", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Link the native LiveKit SDK and the WebRTC media path (`native` +
+# `video` modules; also gates the tokio time driver used by the native
+# transport's `sleep`). The parent `livekit-portal` crate enables this;
+# wasm builds compile core with default features.
+native = ["dep:livekit", "dep:yuv-sys", "dep:futures-util", "tokio/time"]
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt-multi-thread"] }

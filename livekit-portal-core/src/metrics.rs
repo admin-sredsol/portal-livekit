@@ -378,6 +378,14 @@ pub struct TrackMetrics {
     pub jitter: Mutex<JitterState>,
 }
 
+/// `new` zero-initializes every counter, so `Default` is the same
+/// operation (satisfies clippy's `new_without_default`).
+impl Default for TrackMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrackMetrics {
     pub fn new() -> Self {
         Self {

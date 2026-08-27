@@ -15,12 +15,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use livekit::prelude::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::metrics::MetricsRegistry;
-use crate::video::now_us;
+use crate::time::now_us;
+use crate::transport::PortalTransport;
 
 pub(crate) const RTT_TOPIC: &str = "portal_rtt";
 const PING_KIND: u8 = 0;
@@ -34,6 +34,11 @@ const RTT_QUEUE_CAP: usize = 64;
 /// Handles both outbound pings (on a timer) and outbound pongs (echoes of
 /// received pings), serialized through a single bounded channel so the
 /// receive handler can enqueue a pong without awaiting.
+///
+/// The ping cadence uses `transport.sleep` rather than an executor interval,
+/// so the same code runs against a JS transport backed by browser timers.
+/// A sleep-loop drifts slightly (each lap adds the send time, like
+/// `MissedTickBehavior::Delay`), which is fine for a 1Hz best-effort probe.
 pub(crate) struct RttService {
     tx: mpsc::Sender<Vec<u8>>,
     ping_task: Option<JoinHandle<()>>,
@@ -43,22 +48,18 @@ pub(crate) struct RttService {
 
 impl RttService {
     pub fn spawn(
-        local_participant: LocalParticipant,
+        transport: Arc<dyn PortalTransport>,
         ping_interval_ms: u64,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(RTT_QUEUE_CAP);
 
-        let lp_send = local_participant;
+        let transport_send = transport.clone();
         let send_task = tokio::spawn(async move {
             while let Some(payload) = rx.recv().await {
-                let packet = DataPacket {
-                    payload,
-                    topic: Some(RTT_TOPIC.to_string()),
-                    reliable: false, // retransmits would inflate RTT
-                    destination_identities: Vec::new(),
-                };
-                if let Err(e) = lp_send.publish_data(packet).await {
+                if let Err(e) =
+                    transport_send.publish_data(payload, Some(RTT_TOPIC.to_string()), false).await
+                {
                     log::warn!("[publish-failed] rtt publish failed: {e}");
                 }
             }
@@ -68,10 +69,8 @@ impl RttService {
             let tx_ping = tx.clone();
             let metrics_ping = metrics.clone();
             Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(ping_interval_ms));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    interval.tick().await;
+                    transport.sleep(Duration::from_millis(ping_interval_ms)).await;
                     let ts = now_us();
                     let mut payload = Vec::with_capacity(9);
                     payload.push(PING_KIND);

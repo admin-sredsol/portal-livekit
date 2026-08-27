@@ -12,13 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Portal's orchestration: role setup, the publish paths (state, action,
+//! chunk, video), the receive pipeline (data packets, byte streams, video
+//! tracks), RPC routing, and the v0.2 multi-controller layer.
+//!
+//! Everything here is programmed against the [`PortalTransport`] trait, so
+//! the identical logic runs against the native LiveKit SDK transport
+//! (`LiveKitRustTransport`, behind the `native` feature) and, on wasm, a
+//! JS-backed transport. SDK-specific concerns — room options, E2EE, the
+//! event pump, RPC wire encoding — live in the transport, not here.
+
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
-use livekit::prelude::*;
-use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
@@ -36,8 +44,11 @@ use crate::rpc::{RpcError, RpcHandler, RpcInvocationData};
 use crate::rtt::RttService;
 use crate::serialization::{action_fingerprint, schema_fingerprint};
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
+use crate::time::now_us;
+use crate::transport::{
+    PortalTransport, TransportConnect, TransportEvent, TransportRpcRequest, VideoSink,
+};
 use crate::types::*;
-use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
 
 /// Participant attribute keys used by Portal for role discovery and the
 /// multi-controller pointer. Namespaced to avoid colliding with any
@@ -51,12 +62,12 @@ const ROLE_VALUE_OPERATOR: &str = "operator";
 /// the empty string to clear. Result is the empty string on success.
 pub const SET_ACTIVE_OPERATOR_RPC: &str = "portal.set_active_operator";
 
-/// App-level RPC error code (outside the SDK's 1001-1999 reserved range)
-/// returned when the robot has not yet finished setting up its
-/// LocalParticipant.
+/// App-level RPC error code (outside the transport's 1001-1999 reserved
+/// range) returned when the robot has not yet finished setting up its
+/// connection.
 const RPC_NOT_CONNECTED: u32 = 2001;
-/// App-level RPC error code returned when the SDK's `set_attributes` fails
-/// while the robot is processing a `set_active_operator` request.
+/// App-level RPC error code returned when `set_attributes` fails while the
+/// robot is processing a `set_active_operator` request.
 const RPC_SET_ATTRIBUTES_FAILED: u32 = 2002;
 
 type ObservationCb = Box<dyn Fn(&Observation) + Send + Sync>;
@@ -130,15 +141,15 @@ impl ControllerState {
         *self.robot_identity.lock() = None;
     }
 
-    /// Partial clear used on `RoomEvent::Reconnected`. Drops the per-room
-    /// rosters (`operators`, `robot_identity`) so post-reconnect
+    /// Partial clear used on reconnect. Drops the per-room rosters
+    /// (`operators`, `robot_identity`) so post-reconnect
     /// `ParticipantConnected` events can rebuild them from scratch, but
     /// keeps `active_operator` pinned. Two reasons:
     ///
     /// * **Robot side.** The robot's `active_operator` is the source of
     ///   truth (mirrored as its own `lk.portal.active_operator` attribute).
     ///   The robot ignores attribute events on its local identity (see
-    ///   `ParticipantAttributesChanged` filter), and the SDK never fires
+    ///   the `ParticipantAttributesChanged` filter), and the SDK never fires
     ///   `ParticipantConnected` for self, so a full clear here would leave
     ///   the gate stuck at `None` until something explicitly re-set it —
     ///   silently halting control across a transient reconnect.
@@ -187,7 +198,7 @@ impl ObservationSink {
     pub(crate) fn dispatch(&self, output: SyncOutput) {
         let SyncOutput { observations, drops } = output;
 
-        // User callbacks run on the tokio worker dispatching room events.
+        // User callbacks run on the task dispatching room events.
         // A panic here would abort the whole event loop, so we catch and
         // log and keep going.
         if !observations.is_empty() {
@@ -239,7 +250,6 @@ impl ObservationSink {
 }
 
 struct ConnectionState {
-    room: Option<Room>,
     event_task: Option<JoinHandle<()>>,
     rtt: Option<Arc<RttService>>,
 }
@@ -248,7 +258,7 @@ pub struct Portal {
     config: PortalConfig,
 
     // Serializes connect()/disconnect() so a disconnect() yielding on
-    // room.close().await can't be overtaken by a concurrent connect()
+    // close().await can't be overtaken by a concurrent connect()
     // whose newly-populated state would then be clobbered by the
     // disconnect's cleanup path.
     lifecycle: tokio::sync::Mutex<()>,
@@ -256,13 +266,16 @@ pub struct Portal {
     // Lifecycle state (connect/disconnect).
     conn: Mutex<ConnectionState>,
 
-    // Video receivers are spawned by the event loop (on TrackSubscribed) and
-    // torn down by `disconnect`, so they live in an Arc shared with both.
-    video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
+    // The transport backing this session. Set as soon as the transport's
+    // room is up (before role attributes and publishers are written), so a
+    // concurrent `register_rpc_method` forwards immediately; cleared on
+    // disconnect and failed connects.
+    transport: Mutex<Option<Arc<dyn PortalTransport>>>,
 
     // Hot-path publishers. Each is guarded by its own mutex so send methods
-    // can clone the Arc out and drop the lock before doing any IO.
-    video_publishers: Mutex<HashMap<String, Arc<VideoPublisher>>>,
+    // can clone the Arc out and drop the lock before doing any IO. WebRTC
+    /// media-path video publishers are owned by the transport itself (they
+    /// are SDK-coupled); Portal only drives the frame-video publisher.
     /// Robot-side: one publisher per declared frame-video track. Frame-video
     /// frames travel as byte streams (per-frame RGB encode), bypassing the
     /// WebRTC media path.
@@ -295,35 +308,21 @@ pub struct Portal {
     all_track_names: Vec<String>,
     /// Per-track frame-video entries (spec + slots + metrics fused). Fixed
     /// at construction and shared as an `Arc<HashMap>` so the receive
-    /// dispatch can fan out to per-frame spawn tasks via a refcount bump
-    /// instead of cloning the whole map (which would allocate one `String`
+    /// dispatch can fan out into spawn tasks via a refcount bump
+    /// instead of cloning the map (which would allocate one `String`
     /// per declared track per received frame).
     frame_video_entries: Arc<HashMap<String, Arc<FrameVideoTrackEntry>>>,
 
     metrics: Arc<MetricsRegistry>,
 
-    // RPC methods the caller has registered. Applied to the LocalParticipant
+    // RPC methods the caller has registered. Applied to the transport
     // on connect(); survives disconnect so reconnects reapply them.
     rpc_handlers: Arc<Mutex<HashMap<String, RpcHandler>>>,
-
-    // Local-participant handle held in its own `Arc<Mutex<...>>` so the
-    // built-in `set_active_operator` RPC handler can clone access to it
-    // without sharing the broader `ConnectionState`.
-    local_participant: Arc<Mutex<Option<LocalParticipant>>>,
 
     // Multi-controller state (v0.2). Shared with the room event handler so
     // attribute-change and participant-connect events can update operators,
     // robot_identity, and active_operator without taking a Portal-level lock.
     controller: Arc<ControllerState>,
-
-    // Handle to the tokio runtime `connect()` ran on. Captured because
-    // `register_rpc_method` can be called from a foreign thread with no
-    // runtime context (e.g. a binding's asyncio loop); registering an RPC
-    // method on a live LocalParticipant triggers publisher negotiation,
-    // which `tokio::spawn`s and would otherwise panic with "no reactor
-    // running". We enter this handle around that call. `None` before the
-    // first connect.
-    runtime_handle: Mutex<Option<tokio::runtime::Handle>>,
 }
 
 impl Portal {
@@ -382,9 +381,8 @@ impl Portal {
         Self {
             config,
             lifecycle: tokio::sync::Mutex::new(()),
-            conn: Mutex::new(ConnectionState { room: None, event_task: None, rtt: None }),
-            video_receivers: Arc::new(Mutex::new(HashMap::new())),
-            video_publishers: Mutex::new(HashMap::new()),
+            conn: Mutex::new(ConnectionState { event_task: None, rtt: None }),
+            transport: Mutex::new(None),
             frame_video_publishers: Mutex::new(HashMap::new()),
             state_publisher: Mutex::new(None),
             action_publisher: Mutex::new(None),
@@ -400,71 +398,83 @@ impl Portal {
             frame_video_entries,
             metrics,
             rpc_handlers: Arc::new(Mutex::new(HashMap::new())),
-            local_participant: Arc::new(Mutex::new(None)),
             controller: Arc::new(ControllerState::new()),
-            runtime_handle: Mutex::new(None),
         }
     }
 
+    /// Connect using the native LiveKit SDK transport. This is the standard
+    /// entry point on native platforms; it exists behind the crate's
+    /// `native` cargo feature and is a thin wrapper that constructs
+    /// [`crate::native::LiveKitRustTransport`] and delegates to
+    /// [`Portal::connect_with_transport`].
+    #[cfg(feature = "native")]
     pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
+        let transport =
+            Arc::new(crate::native::LiveKitRustTransport::new(self.config.clone(), self.metrics.clone()));
+        self.connect_with_transport(transport, url, token).await
+    }
+
+    /// Connect using a caller-provided transport. Room setup that the SDK
+    /// would do (signal/WebRTC connect, E2EE, WebRTC-path video track
+    /// publishing) happens inside `transport.connect`; everything Portal
+    /// owns — role attributes, the multi-controller layer, data and
+    /// byte-stream publishers, RPC routing, the event pipeline — runs here,
+    /// transport-agnostic.
+    ///
+    /// The transport must be reusable: `disconnect()` releases its
+    /// connection so a later `connect_with_transport` on the same instance
+    /// starts fresh.
+    pub async fn connect_with_transport(
+        &self,
+        transport: Arc<dyn PortalTransport>,
+        url: &str,
+        token: &str,
+    ) -> PortalResult<()> {
         let _lifecycle = self.lifecycle.lock().await;
-        // Capture the runtime we're running on so `register_rpc_method` can
-        // enter it when called later from a non-runtime (foreign) thread.
-        *self.runtime_handle.lock() = Some(tokio::runtime::Handle::current());
-        if self.conn.lock().room.is_some() {
+        if self.conn.lock().event_task.is_some() {
             return Err(PortalError::AlreadyConnected);
-        }
-
-        static OTHER_SDKS_VALUE: &str =
-            concat!("portal:", env!("CARGO_PKG_VERSION"));
-
-        let mut options = RoomOptions::default();
-        options.sdk_options.other_sdks = Some(OTHER_SDKS_VALUE.to_string());
-        options.auto_subscribe = true;
-        if let Some(key) = &self.config.shared_key {
-            use livekit::E2eeOptions;
-            use livekit::e2ee::{
-                EncryptionType,
-                key_provider::{KeyProvider, KeyProviderOptions},
-            };
-            let key_provider =
-                KeyProvider::with_shared_key(KeyProviderOptions::default(), key.clone());
-            options.encryption =
-                Some(E2eeOptions { key_provider, encryption_type: EncryptionType::Gcm });
         }
 
         log::info!("[{}] connecting as {:?} to {}", self.config.session, self.config.role, url);
 
-        let (room, events) = Room::connect(url, token, options)
-            .await
-            .map_err(|e| PortalError::Room(e.to_string()))?;
-
-        // Store the LocalParticipant before applying handlers so a concurrent
-        // `register_rpc_method` either (a) inserts before we iterate and gets
-        // picked up, or (b) inserts after we've stored LP and forwards the
-        // handler itself. Overlap is idempotent — the SDK's rpc handler map
-        // is last-writer-wins.
-        let local_participant = room.local_participant();
-        *self.local_participant.lock() = Some(local_participant.clone());
-
         // Robot-side: register the built-in `set_active_operator` RPC. The
-        // handler clones the LP slot and the controller Arc so the closure
+        // handler clones the transport and the controller Arc so the closure
         // can update both the attribute and the local mirror without holding
-        // any Portal-level lock.
+        // any Portal-level lock. Registration lands in the handler map and
+        // is applied to the room below, alongside caller-registered methods.
         if self.config.role == Role::Robot {
-            let lp_slot = self.local_participant.clone();
+            let transport_for_rpc = transport.clone();
             let controller = self.controller.clone();
             let handler: RpcHandler = Arc::new(move |data: RpcInvocationData| {
-                let lp_slot = lp_slot.clone();
+                let transport_for_rpc = transport_for_rpc.clone();
                 let controller = controller.clone();
-                Box::pin(
-                    async move { set_active_operator_rpc_impl(&lp_slot, &controller, data).await },
-                )
+                Box::pin(async move {
+                    set_active_operator_rpc_impl(&*transport_for_rpc, &controller, data).await
+                })
             });
             self.register_rpc_method(SET_ACTIVE_OPERATOR_RPC, handler);
         }
 
-        self.apply_rpc_handlers(&local_participant);
+        // Connect the room. The transport receives its event sink and the
+        // byte-stream topics this Portal consumes up front; everything it
+        // translates lands on the channel and is drained by the event loop
+        // spawned below.
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connect_params = TransportConnect {
+            url,
+            token,
+            events: events_tx,
+            byte_stream_topics: self.byte_stream_topics(),
+        };
+        transport.connect(connect_params).await?;
+
+        // Store the transport before applying handlers so a concurrent
+        // `register_rpc_method` either (a) inserts before we iterate and gets
+        // picked up, or (b) inserts after we've stored it and forwards the
+        // handler itself. Overlap is idempotent — the transport-side handler
+        // map is last-writer-wins.
+        *self.transport.lock() = Some(transport.clone());
+        self.apply_rpc_handlers();
 
         // Self-set the role attribute so other participants can discover us.
         // Token-mint may also have set this key; in that case `set_attributes`
@@ -475,15 +485,15 @@ impl Portal {
         };
         let mut role_attrs = HashMap::new();
         role_attrs.insert(ROLE_ATTR_KEY.to_string(), role_value.to_string());
-        if let Err(e) = local_participant.set_attributes(role_attrs).await {
+        if let Err(e) = transport.set_attributes(role_attrs).await {
             // Most common cause: the token grant did not include
             // `canUpdateOwnMetadata`. Surface a clear error so callers fix
             // their token-mint script rather than silently leaving the
             // participant unidentified. Roll back the partial state we
-            // already wrote (LP slot, RPC handler bindings) so a retry
-            // starts from a clean slate.
+            // already wrote (transport slot, RPC handler bindings) so a
+            // retry starts from a clean slate.
             self.rollback_partial_connect();
-            let _ = room.close().await;
+            let _ = transport.disconnect().await;
             return Err(PortalError::Room(format!(
                 "failed to publish role attribute (token may be missing canUpdateOwnMetadata): {e}"
             )));
@@ -493,7 +503,7 @@ impl Portal {
         // mirror it locally so the action gate sees the configured pointer
         // before anyone calls `set_active_operator`.
         if self.config.role == Role::Robot {
-            let attrs = local_participant.attributes();
+            let attrs = transport.local_attributes();
             if let Some(seed) = attrs.get(ACTIVE_OPERATOR_ATTR_KEY) {
                 let value = if seed.is_empty() { None } else { Some(seed.clone()) };
                 *self.controller.active_operator.lock() = value;
@@ -503,34 +513,34 @@ impl Portal {
         // Walk the room snapshot once at connect so any participant that
         // joined before us is already in `operators` / `robot_identity`. New
         // joiners get added by the `ParticipantConnected` event handler.
-        for (_sid, participant) in room.remote_participants() {
+        for participant in transport.remote_participants() {
             classify_and_update(
                 &self.controller,
                 self.config.role,
-                &participant.identity(),
-                &participant.attributes(),
+                &participant.identity,
+                &participant.attributes,
             );
         }
 
         let setup_result = match self.config.role {
-            Role::Robot => self.setup_robot(&room).await,
+            Role::Robot => self.setup_robot(&transport),
             Role::Operator => {
-                self.setup_operator(&room);
+                self.setup_operator(&transport);
                 Ok(())
             }
         };
         if let Err(e) = setup_result {
-            // setup_robot can fail mid-way through publishing video tracks.
-            // Its own rollback already clears the partial video_publishers
-            // map; we still need to undo the LP slot, controller mirror,
-            // and any other state written above before bailing.
+            // Setup can fail mid-way through building publishers. Their own
+            // constructors already clean up their partial maps on drop; we
+            // still need to undo the transport slot, controller mirror, and
+            // any other state written above before bailing.
             self.rollback_partial_connect();
-            let _ = room.close().await;
+            let _ = transport.disconnect().await;
             return Err(e);
         }
 
         let rtt = Arc::new(RttService::spawn(
-            local_participant.clone(),
+            transport.clone(),
             self.config.ping_ms,
             self.metrics.clone(),
         ));
@@ -547,7 +557,9 @@ impl Portal {
         // plain Vec, not a HashMap.
         let chunk_slots_for_dispatch: Vec<Arc<ChunkSlot>> =
             self.chunk_slots.values().cloned().collect();
-        let local_identity = local_participant.identity().as_str().to_string();
+        let local_identity = transport
+            .local_identity()
+            .expect("transport reports a local identity after a successful connect");
         let ctx = EventContext {
             config: self.config.clone(),
             action_schema_fp,
@@ -559,22 +571,20 @@ impl Portal {
             chunk_slots: chunk_slots_for_dispatch,
             unknown_chunk_fp_warns: self.unknown_chunk_fp_warns.clone(),
             video_tracks: self.video_tracks.clone(),
-            video_receivers: self.video_receivers.clone(),
             frame_video_entries: self.frame_video_entries.clone(),
             metrics: self.metrics.clone(),
             rtt: rtt.clone(),
             controller: self.controller.clone(),
             local_identity,
+            transport: transport.clone(),
         };
         let event_handle = tokio::spawn(async move {
-            let mut events = events;
-            while let Some(event) = events.recv().await {
+            while let Some(event) = events_rx.recv().await {
                 handle_room_event(&ctx, event);
             }
         });
 
         let mut state = self.conn.lock();
-        state.room = Some(room);
         state.event_task = Some(event_handle);
         state.rtt = Some(rtt);
         Ok(())
@@ -588,16 +598,27 @@ impl Portal {
         height: u32,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        // Two transports, one user-facing method. WebRTC publishers and
-        // frame-video publishers are populated by `add_video` at config
-        // time — codec selection routes the spec to one list or the
-        // other — and names are unique across both, so a track lives in
-        // exactly one map.
-        if let Some(publisher) = self.video_publishers.lock().get(track_name).cloned() {
-            return publisher.send_frame(rgb_data, width, height, timestamp_us);
-        }
-        if let Some(publisher) = self.frame_video_publishers.lock().get(track_name).cloned() {
-            return publisher.send_frame(rgb_data, width, height, timestamp_us);
+        // Two transports, one user-facing method. WebRTC-path publishers
+        // live in the native transport (populated at connect from the
+        // config's `video_tracks`); frame-video publishers are built here in
+        // `setup_robot`. Names are unique across both, so a track lives in
+        // exactly one place.
+        let transport = self.transport.lock().clone();
+        if let Some(transport) = &transport {
+            if self.config.role == Role::Robot
+                && self.config.video_tracks.iter().any(|s| s.name == track_name)
+            {
+                return transport.publish_video_frame(
+                    track_name,
+                    rgb_data,
+                    width,
+                    height,
+                    timestamp_us,
+                );
+            }
+            if let Some(publisher) = self.frame_video_publishers.lock().get(track_name).cloned() {
+                return publisher.send_frame(rgb_data, width, height, timestamp_us);
+            }
         }
         // Distinguish wrong-role (track is declared but no publisher exists
         // because send is operator-side) from genuinely unknown-track. The
@@ -648,9 +669,9 @@ impl Portal {
         // the wire so the local echo (if any) sees the same value the
         // robot sees. `send_map` would default `None` to `now_us()` and
         // we'd pick a slightly later timestamp here.
-        let send_ts = timestamp_us.unwrap_or_else(crate::video::now_us);
+        let send_ts = timestamp_us.unwrap_or_else(now_us);
         let wire_values = publisher.send_map(values, Some(send_ts), in_reply_to_ts_us)?;
-        // Echo path. LiveKit does not fan out a publisher's own data
+        // Echo path. The room does not fan out a publisher's own data
         // packets, so without this an active operator would never see its
         // own action through `on_action`. We only echo when subscription
         // is on AND we are the active operator: otherwise this would just
@@ -716,7 +737,7 @@ impl Portal {
                 Err(PortalError::NotConnected)
             };
         };
-        let send_ts = timestamp_us.unwrap_or_else(crate::video::now_us);
+        let send_ts = timestamp_us.unwrap_or_else(now_us);
         publisher.send(data, Some(send_ts), in_reply_to_ts_us)?;
         // Echo path: same conditions as `send_action`. Unlike scalar
         // actions where we rebuild the typed values, chunks already carry
@@ -772,10 +793,11 @@ impl Portal {
 
     // --- Multi-controller surface (v0.2) ---
 
-    /// This Portal's own LiveKit identity once connected. Reads from the
-    /// stored `LocalParticipant`. `None` before `connect()` succeeds.
+    /// This Portal's own identity once connected. Reads from the transport.
+    /// `None` before `connect()` succeeds.
     pub fn local_identity(&self) -> Option<String> {
-        self.local_participant.lock().as_ref().map(|lp| lp.identity().as_str().to_string())
+        let transport = self.transport.lock().clone()?;
+        transport.local_identity()
     }
 
     /// Identity of the operator the robot is currently listening to, or
@@ -806,14 +828,15 @@ impl Portal {
     pub async fn set_active_operator(&self, identity: Option<String>) -> PortalResult<()> {
         match self.config.role {
             Role::Robot => {
-                let lp = self.local_participant.lock().clone().ok_or(PortalError::NotConnected)?;
+                let transport =
+                    self.transport.lock().clone().ok_or(PortalError::NotConnected)?;
                 let prev = self.controller.active_operator.lock().clone();
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     ACTIVE_OPERATOR_ATTR_KEY.to_string(),
                     identity.clone().unwrap_or_default(),
                 );
-                lp.set_attributes(attrs).await.map_err(|e| PortalError::Room(e.to_string()))?;
+                transport.set_attributes(attrs).await?;
                 *self.controller.active_operator.lock() = identity.clone();
                 if prev != identity {
                     self.controller.fire_active_changed(identity.as_deref());
@@ -827,10 +850,10 @@ impl Portal {
                 //   await op.connect(...)
                 //   await op.set_active_operator(op.local_identity())
                 //
-                // immediately after connect, before the SDK has surfaced the
+                // immediately after connect, before the room has surfaced the
                 // robot's attributes via `ParticipantAttributesChanged`. To
                 // make that work without forcing every caller to manually
-                // wait, we scan `remote_participants()` and, if still empty,
+                // wait, we scan the room snapshot and, if still empty,
                 // poll briefly. Bounded at ~1.5 s — long enough for the
                 // initial attribute event on a healthy LAN, short enough to
                 // surface NoPeer quickly when there really is no robot.
@@ -882,36 +905,23 @@ impl Portal {
     }
 
     /// Register an RPC method handler. Handlers can be registered before or
-    /// after `connect()`; stored handlers are (re)applied to the
-    /// `LocalParticipant` on each connect.
+    /// after `connect()`; stored handlers are (re)applied to the transport
+    /// on each connect.
     pub fn register_rpc_method(&self, method: &str, handler: RpcHandler) {
         {
             let mut map = self.rpc_handlers.lock();
             map.insert(method.to_string(), handler.clone());
         }
-        if let Some(lp) = self.local_participant.lock().clone() {
-            // The SDK's `register_rpc_method` kicks off publisher negotiation,
-            // which `tokio::spawn`s internally. If we were called from a
-            // foreign thread with no runtime context (a binding's asyncio
-            // loop), that spawn panics. Enter the runtime `connect()` ran on
-            // so the spawn lands on it. The handle is always present here
-            // (an LP exists only after a successful connect set it), but fall
-            // back to a bare call rather than panicking if it somehow isn't.
-            match self.runtime_handle.lock().clone() {
-                Some(handle) => {
-                    let _guard = handle.enter();
-                    register_handler_on(&lp, method.to_string(), handler);
-                }
-                None => register_handler_on(&lp, method.to_string(), handler),
-            }
+        if let Some(transport) = self.transport.lock().clone() {
+            transport.register_rpc_method(method.to_string(), handler);
         }
     }
 
     /// Remove a previously registered RPC method handler.
     pub fn unregister_rpc_method(&self, method: &str) {
         self.rpc_handlers.lock().remove(method);
-        if let Some(lp) = self.local_participant.lock().clone() {
-            lp.unregister_rpc_method(method.to_string());
+        if let Some(transport) = self.transport.lock().clone() {
+            transport.unregister_rpc_method(method);
         }
     }
 
@@ -932,34 +942,56 @@ impl Portal {
             Some(id) => id.to_string(),
             None => self.resolve_peer()?,
         };
-        let lp = self.local_participant.lock().clone().ok_or(PortalError::NotConnected)?;
-
-        let mut data = PerformRpcData {
-            destination_identity: destination,
-            method: method.to_string(),
-            payload,
-            ..Default::default()
-        };
-        if let Some(t) = response_timeout {
-            data.response_timeout = t;
-        }
-
-        lp.perform_rpc(data).await.map_err(|e| PortalError::Rpc(rpc_error_from_sdk(e)))
+        let transport = self.transport.lock().clone().ok_or(PortalError::NotConnected)?;
+        transport
+            .perform_rpc(TransportRpcRequest {
+                destination,
+                method: method.to_string(),
+                payload,
+                response_timeout,
+            })
+            .await
+            .map_err(PortalError::Rpc)
     }
 
-    /// Walk `room.remote_participants()` looking for one whose attributes
-    /// declare `role=robot`. Synchronous one-shot lookup.
+    /// Byte-stream topics this Portal consumes, computed from the role and
+    /// config. Passed to the transport at connect so streams opened on any
+    /// other topic are dropped without being read — the transport-level
+    /// equivalent of the take-or-drop decision the event handler used to
+    /// make inline, and it keeps the receive hot path free for peers
+    /// sharing the room.
+    fn byte_stream_topics(&self) -> HashSet<String> {
+        let mut topics = HashSet::new();
+        match self.config.role {
+            Role::Robot => {
+                // Robot always consumes action chunks.
+                topics.insert(ACTION_CHUNK_TOPIC.to_string());
+            }
+            Role::Operator => {
+                // Operators consume chunks only with subscription on (HITL
+                // recording, shadow eval); frame video whenever any
+                // frame-video track is declared.
+                if self.config.action_subscription {
+                    topics.insert(ACTION_CHUNK_TOPIC.to_string());
+                }
+                if !self.config.frame_video_tracks.is_empty() {
+                    topics.insert(FRAME_VIDEO_TOPIC.to_string());
+                }
+            }
+        }
+        topics
+    }
+
+    /// Walk the transport's participant snapshot looking for one whose
+    /// attributes declare `role=robot`. Synchronous one-shot lookup.
     fn find_robot_in_room(&self) -> Option<String> {
-        let conn = self.conn.lock();
-        let room = conn.room.as_ref()?;
-        for (_sid, participant) in room.remote_participants() {
-            let attrs = participant.attributes();
-            if classify_role(&attrs) == Some(Role::Robot) {
-                let id = participant.identity().as_str().to_string();
+        let transport = self.transport.lock().clone()?;
+        for participant in transport.remote_participants() {
+            if classify_role(&participant.attributes) == Some(Role::Robot) {
                 // Cache for subsequent calls so the slow path runs at most
                 // once per session.
-                *self.controller.robot_identity.lock() = Some(id.clone());
-                return Some(id);
+                *self.controller.robot_identity.lock() = Some(participant.identity.clone());
+                return Some(participant.identity);
             }
         }
         None
@@ -967,7 +999,7 @@ impl Portal {
 
     /// Resolve the robot's identity for an operator-side RPC. Tries the
     /// cached value first (populated by attribute events), then a synchronous
-    /// scan of `room.remote_participants()`, then a short polling loop so
+    /// scan of the room snapshot, then a short polling loop so
     /// `set_active_operator` works immediately after `connect()` without
     /// racing the initial attribute-propagation event. Returns `NoPeer`
     /// after the timeout if no participant with `role=robot` ever appears.
@@ -978,10 +1010,14 @@ impl Portal {
         if let Some(id) = self.find_robot_in_room() {
             return Ok(id);
         }
+        // Not connected — there is no room to find a robot in.
+        let Some(transport) = self.transport.lock().clone() else {
+            return Err(PortalError::NoPeer);
+        };
         // Poll for ~1.5s in 50ms ticks. On a healthy LAN the first
         // ParticipantAttributesChanged event lands well within this window.
         for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            transport.sleep(Duration::from_millis(50)).await;
             if let Some(id) = self.controller.robot_identity.lock().clone() {
                 return Ok(id);
             }
@@ -1009,48 +1045,39 @@ impl Portal {
                 }
             }
         }
-        let conn = self.conn.lock();
-        let room = conn.room.as_ref().ok_or(PortalError::NotConnected)?;
-        let remotes = room.remote_participants();
+        let transport = self.transport.lock().clone().ok_or(PortalError::NotConnected)?;
+        let remotes = transport.remote_participants();
         match remotes.len() {
             0 => Err(PortalError::NoPeer),
-            1 => {
-                let (id, _) = remotes.into_iter().next().expect("remotes has one entry");
-                Ok(id.as_str().to_string())
-            }
+            1 => Ok(remotes.into_iter().next().expect("remotes has one entry").identity),
             _ => Err(PortalError::AmbiguousPeer),
         }
     }
 
-    /// Apply every stored handler to a freshly-connected LocalParticipant.
-    /// Called once from `connect()` after the Room is up.
-    fn apply_rpc_handlers(&self, lp: &LocalParticipant) {
+    /// Apply every stored handler to the freshly-connected transport.
+    /// Called once from `connect_with_transport` after the room is up.
+    fn apply_rpc_handlers(&self) {
+        let Some(transport) = self.transport.lock().clone() else {
+            return;
+        };
         let handlers = self.rpc_handlers.lock().clone();
         for (method, handler) in handlers {
-            register_handler_on(lp, method, handler);
+            transport.register_rpc_method(method, handler);
         }
     }
 
     /// Reset Portal-side state written during a `connect()` that failed
-    /// before reaching the final commit (where `conn.room` / `conn.event_task`
-    /// would be stored). Mirrors the cleanup `disconnect()` does, except it
+    /// before reaching the final commit (where `conn.event_task` would be
+    /// stored). Mirrors the cleanup `disconnect()` does, except it
     /// (a) doesn't take the lifecycle lock — `connect()` already holds it —
-    /// and (b) leaves the room handle for the caller to close, since the
-    /// failing connect path holds it as a local. Without this, a failed
-    /// connect would leave a stale `LocalParticipant` slot, RPC handler
-    /// bindings on a dropped LP, and partial publisher maps that the next
-    /// `connect()` (or any pre-connect getter) would still see.
+    /// and (b) leaves the transport for the caller to close, since the
+    /// failing connect path owns it. Without this, a failed connect would
+    /// leave a stale transport slot, RPC handler bindings on a dead room,
+    /// and partial publisher maps that the next `connect()` (or any
+    /// pre-connect getter) would still see.
     fn rollback_partial_connect(&self) {
-        *self.local_participant.lock() = None;
+        *self.transport.lock() = None;
         self.controller.clear();
-        {
-            let mut receivers = self.video_receivers.lock();
-            for receiver in receivers.values() {
-                receiver.abort();
-            }
-            receivers.clear();
-        }
-        self.video_publishers.lock().clear();
         self.frame_video_publishers.lock().clear();
         *self.state_publisher.lock() = None;
         *self.action_publisher.lock() = None;
@@ -1071,14 +1098,15 @@ impl Portal {
 
     pub async fn disconnect(&self) -> PortalResult<()> {
         let _lifecycle = self.lifecycle.lock().await;
-        let room = self.conn.lock().room.take();
+        let transport = self.transport.lock().take();
         log::info!("disconnecting");
 
-        // close() is best-effort; cleanup must happen even if it errors,
-        // otherwise the Portal would be half-disconnected (room=None but
-        // tasks/publishers still running) and the next connect() would race.
-        let close_result = match room {
-            Some(room) => room.close().await.map_err(|e| PortalError::Room(e.to_string())),
+        // disconnect() is best-effort; cleanup must happen even if it
+        // errors, otherwise the Portal would be half-disconnected (no
+        // transport but tasks/publishers still running) and the next
+        // connect() would race.
+        let disconnect_result = match transport {
+            Some(transport) => transport.disconnect().await,
             None => Ok(()),
         };
 
@@ -1089,20 +1117,11 @@ impl Portal {
             }
             state.rtt = None;
         }
-        *self.local_participant.lock() = None;
         // Multi-controller state (operators, robot_identity, active_operator
         // mirror) is per-connection and cleared so a subsequent connect()
         // starts from a clean slate.
         self.controller.clear();
-        {
-            let mut receivers = self.video_receivers.lock();
-            for receiver in receivers.values() {
-                receiver.abort();
-            }
-            receivers.clear();
-        }
 
-        self.video_publishers.lock().clear();
         self.frame_video_publishers.lock().clear();
         *self.state_publisher.lock() = None;
         *self.action_publisher.lock() = None;
@@ -1121,7 +1140,7 @@ impl Portal {
             slots.clear();
         }
 
-        close_result
+        disconnect_result
     }
 
     // --- Pull API (latest-wins, peek semantics) ---
@@ -1222,39 +1241,17 @@ impl Portal {
 
     // --- Internal ---
 
-    async fn setup_robot(&self, room: &Room) -> PortalResult<()> {
-        let lp = room.local_participant();
-
-        for spec in &self.config.video_tracks {
-            let track_name = &spec.name;
-            let track_metrics =
-                self.metrics.track(track_name).expect("track metrics registered at construction");
-            let publisher = VideoPublisher::new(
-                track_name,
-                track_metrics,
-                self.config.fps,
-                spec.codec,
-                spec.max_bitrate_kbps,
-                spec.simulcast,
-                spec.screencast,
-            );
-            if let Err(e) = publisher.publish(&lp).await {
-                // Roll back any earlier publishers so their send tasks stop
-                // and connect() leaves Portal in a clean state.
-                self.video_publishers.lock().clear();
-                return Err(e);
-            }
-            log::info!("[{}] published video track '{track_name}'", self.config.session);
-            self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
-        }
-
-        // Frame-video publishers don't go through `LocalParticipant.publish_track`
-        // — they emit one byte stream per frame instead. So no async setup
-        // here, just spawn the per-track drainer task.
+    /// Wire up the Robot-side publishers that don't depend on the WebRTC
+    /// media path. WebRTC-path video tracks are published by the transport
+    /// itself during `connect`; frame-video tracks and state data travel
+    /// through transport-agnostic publishers built here.
+    fn setup_robot(&self, transport: &Arc<dyn PortalTransport>) -> PortalResult<()> {
+        // Frame-video publishers emit one byte stream per frame. No async
+        // setup — just build the publisher (which spawns its drainer task).
         for spec in &self.config.frame_video_tracks {
             let track_metrics =
                 self.metrics.track(&spec.name).expect("track metrics registered at construction");
-            let publisher = FrameVideoPublisher::new(spec.clone(), lp.clone(), track_metrics);
+            let publisher = FrameVideoPublisher::new(spec.clone(), transport.clone(), track_metrics);
             log::info!(
                 "[{}] ready to publish frame-video track '{}' via byte stream (codec={:?}, quality={})",
                 self.config.session,
@@ -1270,7 +1267,7 @@ impl Portal {
                 &self.config.state_schema,
                 STATE_TOPIC,
                 self.config.state_reliable,
-                lp.clone(),
+                transport.clone(),
                 self.metrics.clone(),
                 DataStream::State,
             );
@@ -1286,9 +1283,7 @@ impl Portal {
         Ok(())
     }
 
-    fn setup_operator(&self, room: &Room) {
-        let lp = room.local_participant();
-
+    fn setup_operator(&self, transport: &Arc<dyn PortalTransport>) {
         // Sync buffer treats both transports the same way — it tracks frame
         // arrivals by name, regardless of whether they came from a WebRTC
         // RTP track or a frame-video byte stream. `all_track_names` was
@@ -1312,7 +1307,7 @@ impl Portal {
                 &self.config.action_schema,
                 ACTION_TOPIC,
                 self.config.action_reliable,
-                lp.clone(),
+                transport.clone(),
                 self.metrics.clone(),
                 DataStream::Action,
             );
@@ -1328,7 +1323,7 @@ impl Portal {
                     spec.horizon,
                     spec.fields.len()
                 );
-                let publisher = ChunkPublisher::new(spec.clone(), lp.clone(), self.metrics.clone());
+                let publisher = ChunkPublisher::new(spec.clone(), transport.clone(), self.metrics.clone());
                 self.chunk_publishers.lock().insert(spec.name.clone(), Arc::new(publisher));
             }
         }
@@ -1351,10 +1346,6 @@ impl Portal {
     }
 }
 
-/// Wrap a Portal `RpcHandler` in the signature the SDK expects and install
-/// it on the given LocalParticipant. Payload types are converted at the
-/// boundary — the SDK's `RpcInvocationData` / `RpcError` never leak into
-/// caller-facing code.
 /// Names of every video track on a config, regardless of transport. Used
 /// when registering metrics and sync-buffer slots, since the consumer-facing
 /// API doesn't distinguish WebRTC and frame-video tracks.
@@ -1362,37 +1353,6 @@ fn combined_track_names(config: &PortalConfig) -> Vec<String> {
     let mut names: Vec<String> = config.video_tracks.iter().map(|s| s.name.clone()).collect();
     names.extend(config.frame_video_tracks.iter().map(|s| s.name.clone()));
     names
-}
-
-fn register_handler_on(lp: &LocalParticipant, method: String, handler: RpcHandler) {
-    lp.register_rpc_method(method, move |data| {
-        let handler = handler.clone();
-        Box::pin(async move {
-            let core_data = rpc_invocation_from_sdk(data);
-            handler(core_data).await.map_err(rpc_error_to_sdk)
-        })
-    });
-}
-
-/// Conversions between the SDK's RPC types and the transport-agnostic core
-/// types, applied at the room boundary. These are free functions rather
-/// than `From` impls because neither side of the conversion is local to
-/// this crate (both now live in `livekit-portal-core` and the SDK).
-fn rpc_invocation_from_sdk(d: livekit::prelude::RpcInvocationData) -> RpcInvocationData {
-    RpcInvocationData {
-        request_id: d.request_id,
-        caller_identity: d.caller_identity.as_str().to_string(),
-        payload: d.payload,
-        response_timeout: d.response_timeout,
-    }
-}
-
-fn rpc_error_from_sdk(e: livekit::prelude::RpcError) -> RpcError {
-    RpcError { code: e.code, message: e.message, data: e.data }
-}
-
-fn rpc_error_to_sdk(e: RpcError) -> livekit::prelude::RpcError {
-    livekit::prelude::RpcError::new(e.code, e.message, e.data)
 }
 
 /// Snapshot of the fields the room event loop needs, so it doesn't take any
@@ -1411,7 +1371,6 @@ struct EventContext {
     chunk_slots: Vec<Arc<ChunkSlot>>,
     unknown_chunk_fp_warns: Arc<Mutex<HashSet<u32>>>,
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
-    video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
     /// Frame-video entries (spec + slots + metrics fused) keyed by track
     /// name. Shared as `Arc<HashMap>` so per-frame fan-out into spawn
     /// tasks bumps a refcount instead of cloning the map.
@@ -1426,6 +1385,9 @@ struct EventContext {
     /// observed via `ParticipantConnected` / `ParticipantAttributesChanged` —
     /// our own attribute updates also fire these events on the local participant.
     local_identity: String,
+    /// The transport the event stream came from; the receiver path uses it
+    /// to spawn video receivers on subscribed WebRTC tracks.
+    transport: Arc<dyn PortalTransport>,
 }
 
 /// Classify a remote participant by their `lk.portal.role` attribute and
@@ -1436,10 +1398,10 @@ struct EventContext {
 fn classify_and_update(
     controller: &ControllerState,
     self_role: Role,
-    identity: &ParticipantIdentity,
+    identity: &str,
     attrs: &HashMap<String, String>,
 ) {
-    let id = identity.as_str().to_string();
+    let id = identity.to_string();
     match classify_role(attrs) {
         Some(Role::Robot) => {
             {
@@ -1480,19 +1442,18 @@ fn classify_and_update(
 /// pointer and the broadcast attribute, then fires
 /// `on_active_operator_changed` if the value actually moved.
 async fn set_active_operator_rpc_impl(
-    lp_slot: &Mutex<Option<LocalParticipant>>,
+    transport: &dyn PortalTransport,
     controller: &ControllerState,
     data: RpcInvocationData,
 ) -> Result<String, RpcError> {
     let identity = if data.payload.is_empty() { None } else { Some(data.payload.clone()) };
-    let lp = lp_slot.lock().clone();
-    let Some(lp) = lp else {
+    if transport.local_identity().is_none() {
         return Err(RpcError::new(RPC_NOT_CONNECTED, "robot not connected", None));
-    };
+    }
     let prev = controller.active_operator.lock().clone();
     let mut attrs = HashMap::new();
     attrs.insert(ACTIVE_OPERATOR_ATTR_KEY.to_string(), identity.clone().unwrap_or_default());
-    if let Err(e) = lp.set_attributes(attrs).await {
+    if let Err(e) = transport.set_attributes(attrs).await {
         return Err(RpcError::new(
             RPC_SET_ATTRIBUTES_FAILED,
             format!("set_attributes failed: {e}"),
@@ -1506,42 +1467,39 @@ async fn set_active_operator_rpc_impl(
     Ok(String::new())
 }
 
-fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
+fn handle_room_event(ctx: &EventContext, event: TransportEvent) {
     match event {
-        RoomEvent::TrackSubscribed { track, publication, .. } => {
+        TransportEvent::VideoTrackSubscribed { track_name } => {
             if ctx.config.role != Role::Operator {
                 return;
             }
-            if let RemoteTrack::Video(video_track) = track {
-                let track_name = publication.name();
-                if ctx.config.video_tracks.iter().any(|s| s.name == track_name) {
-                    log::info!("[{}] subscribed to video track '{track_name}'", ctx.config.session);
-                    if let Some(sync_buffer) = &ctx.sync_buffer {
-                        let slots = ctx
-                            .video_tracks
-                            .get(track_name.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| Arc::new(VideoTrackSlots::new()));
-                        let track_metrics = ctx
-                            .metrics
-                            .track(track_name.as_str())
-                            .expect("track metrics registered at construction");
+            if ctx.config.video_tracks.iter().any(|s| s.name == track_name) {
+                log::info!("[{}] subscribed to video track '{track_name}'", ctx.config.session);
+                if let Some(sync_buffer) = &ctx.sync_buffer {
+                    let slots = ctx
+                        .video_tracks
+                        .get(track_name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(VideoTrackSlots::new()));
+                    let track_metrics = ctx
+                        .metrics
+                        .track(track_name.as_str())
+                        .expect("track metrics registered at construction");
 
-                        let stream = NativeVideoStream::new(video_track.rtc_track());
-                        let receiver = VideoReceiver::spawn(
-                            track_name.to_string(),
-                            stream,
-                            sync_buffer.clone(),
+                    ctx.transport.start_video_receiver(
+                        &track_name,
+                        VideoSink {
+                            track_name: track_name.clone(),
+                            sync_buffer: sync_buffer.clone(),
                             slots,
-                            ctx.obs_sink.clone(),
-                            track_metrics,
-                        );
-                        ctx.video_receivers.lock().insert(track_name.to_string(), receiver);
-                    }
+                            obs_sink: ctx.obs_sink.clone(),
+                            metrics: track_metrics,
+                        },
+                    );
                 }
             }
         }
-        RoomEvent::DataReceived { payload, topic: Some(topic), participant, .. } => {
+        TransportEvent::DataReceived { payload, topic, sender } => {
             // Active-operator gate. Drop incoming actions whose sender does
             // not match `active_operator`. Applies to both the robot (always
             // processes ACTION_TOPIC) and operators with subscription on
@@ -1552,29 +1510,27 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             // an empty sender — those records don't carry a sender field.
             let gate_sender: String = match (ctx.config.role, topic.as_str()) {
                 (Role::Robot, ACTION_TOPIC) => {
-                    let Some(p) = &participant else {
+                    let Some(sender) = sender else {
                         return;
                     };
-                    let sender_id = p.identity().as_str().to_string();
                     let active = ctx.controller.active_operator.lock().clone();
-                    if active.as_deref() != Some(sender_id.as_str()) {
+                    if active.as_deref() != Some(sender.as_str()) {
                         return;
                     }
-                    sender_id
+                    sender
                 }
                 (Role::Operator, ACTION_TOPIC) => {
                     if !ctx.config.action_subscription {
                         return;
                     }
-                    let Some(p) = &participant else {
+                    let Some(sender) = sender else {
                         return;
                     };
-                    let sender_id = p.identity().as_str().to_string();
                     let active = ctx.controller.active_operator.lock().clone();
-                    if active.as_deref() != Some(sender_id.as_str()) {
+                    if active.as_deref() != Some(sender.as_str()) {
                         return;
                     }
-                    sender_id
+                    sender
                 }
                 _ => String::new(),
             };
@@ -1597,59 +1553,41 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 ctx.obs_sink.dispatch(output);
             }
         }
-        RoomEvent::ByteStreamOpened { reader, topic, participant_identity } => {
+        TransportEvent::ByteStream { topic, sender, payload } => {
             // Two Portal byte-stream topics, each owned by a different role:
             //   * `portal_action_chunk` — operator → robot. Action chunks
             //     too big to fit in a 15 KB data packet.
             //   * `portal_frame_video`  — robot → operator. Per-frame
             //     RGB/PNG/MJPEG payloads that bypass the WebRTC media path.
-            // We `take_if` on the topic so this Portal only consumes streams
-            // it owns; other applications using byte streams on unrelated
-            // topics are left untouched.
+            // The transport has already filtered by the topics Portal
+            // declared at connect (`byte_stream_topics`), and has read each
+            // stream to completion before forwarding it here — a finished
+            // stream is one payload.
             match (ctx.config.role, topic.as_str()) {
-                (Role::Robot, ACTION_CHUNK_TOPIC) | (Role::Operator, ACTION_CHUNK_TOPIC) => {
+                (_, ACTION_CHUNK_TOPIC) => {
                     // Robot always consumes chunks. Operators only consume
                     // when subscription is on (HITL recording, shadow eval).
-                    // Bail out early on operators with subscription off so
-                    // we never spawn the read task.
+                    // The topic filter keeps non-subscribed operators from
+                    // ever seeing the stream; this check is defense in depth.
                     if matches!(ctx.config.role, Role::Operator) && !ctx.config.action_subscription
                     {
                         return;
                     }
-                    let Some(reader) = reader.take() else {
+                    // Apply the active-operator gate at delivery time.
+                    // Sender at delivery wins; a chunk started under one
+                    // operator and finishing under another is dropped if the
+                    // new active is different.
+                    let active = ctx.controller.active_operator.lock().clone();
+                    if active.as_deref() != Some(sender.as_str()) {
                         return;
-                    };
-                    let chunk_slots = ctx.chunk_slots.clone();
-                    let unknown_fp_warns = ctx.unknown_chunk_fp_warns.clone();
-                    let metrics = ctx.metrics.clone();
-                    let controller = ctx.controller.clone();
-                    let sender_id = participant_identity.as_str().to_string();
-                    tokio::spawn(async move {
-                        use livekit::StreamReader;
-                        match reader.read_all().await {
-                            Ok(payload) => {
-                                // Apply the active-operator gate at delivery
-                                // time. Sender at delivery wins; a chunk
-                                // started under one operator and finishing
-                                // under another is dropped if the new active
-                                // is different.
-                                let active = controller.active_operator.lock().clone();
-                                if active.as_deref() != Some(sender_id.as_str()) {
-                                    return;
-                                }
-                                dispatch_chunk_payload(
-                                    &payload,
-                                    &chunk_slots,
-                                    &unknown_fp_warns,
-                                    &metrics,
-                                    sender_id,
-                                )
-                            }
-                            Err(e) => {
-                                log::warn!("[bad-payload] failed to read chunk byte stream: {e}")
-                            }
-                        }
-                    });
+                    }
+                    dispatch_chunk_payload(
+                        &payload,
+                        &ctx.chunk_slots,
+                        &ctx.unknown_chunk_fp_warns,
+                        &ctx.metrics,
+                        sender,
+                    );
                 }
                 (Role::Operator, FRAME_VIDEO_TOPIC) => {
                     // Operator-side: each byte stream carries one frame for
@@ -1659,64 +1597,46 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                     if ctx.frame_video_entries.is_empty() {
                         return;
                     }
-                    let Some(reader) = reader.take() else {
-                        return;
-                    };
                     let Some(sync_buffer) = ctx.sync_buffer.clone() else {
                         return;
                     };
-                    let _ = participant_identity;
-                    // Refcount bumps only — no map or HashMap clone.
-                    let entries = ctx.frame_video_entries.clone();
-                    let obs_sink = ctx.obs_sink.clone();
-                    tokio::spawn(async move {
-                        use livekit::StreamReader;
-                        match reader.read_all().await {
-                            // `Bytes::from(Vec)` is a move. Subsequent
-                            // `Bytes::slice(...)` in the dispatch path is a
-                            // refcount bump, so the `Raw` codec gets a
-                            // zero-copy view of the wire payload all the
-                            // way to `VideoFrameData.data`.
-                            Ok(payload) => {
-                                dispatch_frame_payload(payload, &entries, &sync_buffer, &obs_sink)
-                            }
-                            Err(e) => log::warn!(
-                                "[bad-payload] failed to read frame_video byte stream: {e}"
-                            ),
-                        }
-                    });
+                    let _ = sender;
+                    // `payload` is consumed as `Bytes` so the `Raw` codec
+                    // gets a zero-copy view of the wire payload all the way
+                    // to `VideoFrameData.data`.
+                    dispatch_frame_payload(
+                        payload,
+                        &ctx.frame_video_entries,
+                        &sync_buffer,
+                        &ctx.obs_sink,
+                    );
                 }
                 _ => {}
             }
         }
-        RoomEvent::ParticipantConnected(participant) => {
+        TransportEvent::ParticipantConnected(info) => {
             // Snapshot the peer's attributes once they are visible. We may
             // observe an empty attribute map if the new participant has not
             // yet completed their `set_attributes` call; the
             // `ParticipantAttributesChanged` event will reclassify them when
             // the role attribute lands.
-            let identity = participant.identity();
-            let attrs = participant.attributes();
-            classify_and_update(&ctx.controller, ctx.config.role, &identity, &attrs);
+            classify_and_update(&ctx.controller, ctx.config.role, &info.identity, &info.attributes);
         }
-        RoomEvent::ParticipantAttributesChanged { participant, .. } => {
-            let identity = participant.identity();
+        TransportEvent::ParticipantAttributesChanged(info) => {
             // Skip our own attribute updates: when we self-set `role` /
-            // `active_operator`, the SDK echoes the change back through this
+            // `active_operator`, the room echoes the change back through this
             // event for the local participant.
-            if identity.as_str() == ctx.local_identity {
+            if info.identity == ctx.local_identity {
                 return;
             }
-            let attrs = participant.attributes();
-            classify_and_update(&ctx.controller, ctx.config.role, &identity, &attrs);
+            classify_and_update(&ctx.controller, ctx.config.role, &info.identity, &info.attributes);
         }
-        RoomEvent::ParticipantDisconnected(participant) => {
+        TransportEvent::ParticipantDisconnected { identity } => {
             // Multi-controller bookkeeping. The `active_operator` pointer
             // stays pinned by design (see spec.md §Defaults: "stays pinned");
             // a same-identity reconnect resumes control, a different operator
             // claims explicitly via `set_active_operator`.
-            let identity = participant.identity();
-            let id_str = identity.as_str().to_string();
+            let id_str = identity;
             log::info!("[{}] participant '{}' disconnected", ctx.config.session, id_str);
             if ctx.controller.operators.lock().remove(&id_str) {
                 ctx.controller.fire_op_left(&id_str);
@@ -1726,7 +1646,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 *robot_slot = None;
             }
         }
-        RoomEvent::Reconnected => {
+        TransportEvent::Reconnected => {
             log::info!(
                 "[{}] reconnected, clearing sync buffers and latest slots",
                 ctx.config.session
@@ -1754,6 +1674,5 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             // robot side across any transient reconnect.
             ctx.controller.clear_for_reconnect();
         }
-        _ => {}
     }
 }

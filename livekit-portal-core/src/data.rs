@@ -16,8 +16,6 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use livekit::StreamByteOptions;
-use livekit::prelude::*;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -34,8 +32,9 @@ use crate::serialization::{
     deserialize_values, schema_fingerprint, serialize_action, serialize_chunk, serialize_values,
 };
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
+use crate::time::now_us;
+use crate::transport::PortalTransport;
 use crate::types::{Action, ActionChunk, ChunkColumn, Role, State, TypedValue, to_value_maps};
-use crate::video::now_us;
 
 /// Reserved Portal topics. State and action travel as data packets;
 /// chunks travel as byte streams (their topic is matched on
@@ -58,6 +57,15 @@ const PUBLISH_QUEUE_CAP: usize = 1024;
 /// Keeps the set bounded against an adversarial peer cycling fingerprints.
 const UNKNOWN_FP_WARN_CAP: usize = 256;
 
+/// A serialized packet queued for the publish task. Carries exactly what the
+/// transport's `publish_data` needs; built once in `send_map` so the queue
+/// holds one small struct instead of a wire-format type from the SDK.
+pub(crate) struct OutboundPacket {
+    payload: Vec<u8>,
+    topic: Option<String>,
+    reliable: bool,
+}
+
 /// Publishes serialized state/action packets. Spawns a single background task
 /// at construction; `send` enqueues onto an mpsc channel, preserving ordering
 /// for reliable publishes and avoiding a task allocation per packet.
@@ -69,7 +77,7 @@ pub(crate) struct DataPublisher {
     fingerprint: u32,
     topic: String,
     reliable: bool,
-    tx: mpsc::Sender<DataPacket>,
+    tx: mpsc::Sender<OutboundPacket>,
     task: Option<JoinHandle<()>>,
     metrics: Arc<MetricsRegistry>,
     stream: DataStream,
@@ -92,14 +100,16 @@ impl DataPublisher {
         schema: &[FieldSpec],
         topic: &str,
         reliable: bool,
-        local_participant: LocalParticipant,
+        transport: Arc<dyn PortalTransport>,
         metrics: Arc<MetricsRegistry>,
         stream: DataStream,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<DataPacket>(PUBLISH_QUEUE_CAP);
+        let (tx, mut rx) = mpsc::channel::<OutboundPacket>(PUBLISH_QUEUE_CAP);
         let task = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
-                if let Err(e) = local_participant.publish_data(packet).await {
+                if let Err(e) =
+                    transport.publish_data(packet.payload, packet.topic, packet.reliable).await
+                {
                     log::warn!("[publish-failed] data publish failed: {e}");
                 }
             }
@@ -185,11 +195,10 @@ impl DataPublisher {
         if !saturated_indices.is_empty() {
             self.warn_saturated(&saturated_indices);
         }
-        let packet = DataPacket {
+        let packet = OutboundPacket {
             payload,
             topic: Some(self.topic.clone()),
             reliable: self.reliable,
-            destination_identities: Vec::new(),
         };
         match self.tx.try_send(packet) {
             Ok(()) => {
@@ -267,7 +276,7 @@ impl DataPublisher {
 /// inspected, so this stays O(fields) regardless of horizon. A column that
 /// claims nothing is coerced to the declared dtype at encode.
 ///
-/// Free-standing so it's testable without a live `LocalParticipant`.
+/// Free-standing so it's testable without a live transport.
 fn check_chunk_dtypes(
     fields: &[FieldSpec],
     data: &HashMap<String, ChunkColumn>,
@@ -458,15 +467,14 @@ pub(crate) struct ChunkPublisher {
 impl ChunkPublisher {
     pub fn new(
         spec: ChunkSpec,
-        local_participant: LocalParticipant,
+        transport: Arc<dyn PortalTransport>,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUBLISH_QUEUE_CAP);
         let chunk_name = spec.name.clone();
         let task = tokio::spawn(async move {
             while let Some(payload) = rx.recv().await {
-                let options = StreamByteOptions::new_with_topic(ACTION_CHUNK_TOPIC);
-                if let Err(e) = local_participant.send_bytes(payload, options).await {
+                if let Err(e) = transport.send_bytes(payload, ACTION_CHUNK_TOPIC).await {
                     log::warn!("[publish-failed] chunk '{chunk_name}' byte stream failed: {e}");
                 }
             }
@@ -805,7 +813,7 @@ mod tests {
 
     #[test]
     fn check_dtypes_rejects_variant_mismatch() {
-        // A publisher is heavy to spin up (needs a live LocalParticipant),
+        // A publisher is heavy to spin up (needs a live transport),
         // but the core logic of `check_dtypes` only needs the schema and
         // the input map. Exercise the free function directly on a fake
         // publisher-like setup.

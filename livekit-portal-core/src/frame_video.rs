@@ -69,8 +69,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use livekit::StreamByteOptions;
-use livekit::prelude::*;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -81,8 +79,9 @@ use crate::error::{PortalError, PortalResult};
 use crate::metrics::TrackMetrics;
 use crate::portal::ObservationSink;
 use crate::sync_buffer::SyncBuffer;
-use crate::types::VideoFrameData;
-use crate::video::{VideoTrackSlots, now_us};
+use crate::time::now_us;
+use crate::transport::PortalTransport;
+use crate::types::{VideoFrameData, VideoTrackSlots};
 
 /// Reserved Portal topic for frame-video byte streams. A single topic
 /// multiplexes all frame-video tracks; the per-frame header carries the
@@ -259,15 +258,14 @@ pub(crate) struct FrameVideoPublisher {
 impl FrameVideoPublisher {
     pub fn new(
         spec: FrameVideoSpec,
-        local_participant: LocalParticipant,
+        transport: Arc<dyn PortalTransport>,
         metrics: Arc<TrackMetrics>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUBLISH_QUEUE_CAP);
         let track_name = spec.name.clone();
         let task = tokio::spawn(async move {
             while let Some(payload) = rx.recv().await {
-                let options = StreamByteOptions::new_with_topic(FRAME_VIDEO_TOPIC);
-                if let Err(e) = local_participant.send_bytes(payload, options).await {
+                if let Err(e) = transport.send_bytes(payload, FRAME_VIDEO_TOPIC).await {
                     log::warn!(
                         "[publish-failed] frame_video '{track_name}' byte stream failed: {e}"
                     );

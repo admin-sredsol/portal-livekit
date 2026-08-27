@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 
 use crate::config::FieldSpec;
 use crate::dtype::DType;
@@ -356,5 +357,36 @@ impl From<u8> for TypedValue {
 impl From<bool> for TypedValue {
     fn from(v: bool) -> Self {
         TypedValue::Bool(v)
+    }
+}
+
+// --- Video track slots ---
+
+/// Push callback + latest-wins slot for a single video track, paired so the
+/// receive path and `get_video_frame` share one allocation. Transport-agnostic:
+/// both WebRTC receivers and frame-video byte-stream dispatch feed the same
+/// slots.
+pub type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
+
+/// Per-track slot bundle for video frames, shared by every frame path
+/// (WebRTC and frame-video).
+pub struct VideoTrackSlots {
+    pub cb: Mutex<Option<VideoCb>>,
+    pub latest: Mutex<Option<VideoFrameData>>,
+}
+
+impl VideoTrackSlots {
+    pub fn new() -> Self {
+        Self { cb: Mutex::new(None), latest: Mutex::new(None) }
+    }
+
+    pub fn clear(&self) {
+        *self.latest.lock() = None;
+    }
+}
+
+impl Default for VideoTrackSlots {
+    fn default() -> Self {
+        Self::new()
     }
 }
