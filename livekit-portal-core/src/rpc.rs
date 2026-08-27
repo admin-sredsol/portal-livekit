@@ -68,30 +68,5 @@ pub type RpcHandlerFuture =
     Pin<Box<dyn Future<Output = Result<String, RpcError>> + Send + 'static>>;
 
 /// RPC handler trait object stored on Portal. Cloned into the closure handed
-/// to `LocalParticipant::register_rpc_method` at connect time.
+/// to the transport's `register_rpc_method` at connect time.
 pub type RpcHandler = Arc<dyn Fn(RpcInvocationData) -> RpcHandlerFuture + Send + Sync + 'static>;
-
-// --- Conversions to/from the SDK's types, crate-local ---
-
-impl From<livekit::prelude::RpcError> for RpcError {
-    fn from(e: livekit::prelude::RpcError) -> Self {
-        Self { code: e.code, message: e.message, data: e.data }
-    }
-}
-
-impl From<RpcError> for livekit::prelude::RpcError {
-    fn from(e: RpcError) -> Self {
-        livekit::prelude::RpcError::new(e.code, e.message, e.data)
-    }
-}
-
-impl From<livekit::prelude::RpcInvocationData> for RpcInvocationData {
-    fn from(d: livekit::prelude::RpcInvocationData) -> Self {
-        Self {
-            request_id: d.request_id,
-            caller_identity: d.caller_identity.as_str().to_string(),
-            payload: d.payload,
-            response_timeout: d.response_timeout,
-        }
-    }
-}

@@ -944,7 +944,7 @@ impl Portal {
             data.response_timeout = t;
         }
 
-        lp.perform_rpc(data).await.map_err(|e| PortalError::Rpc(e.into()))
+        lp.perform_rpc(data).await.map_err(|e| PortalError::Rpc(rpc_error_from_sdk(e)))
     }
 
     /// Walk `room.remote_participants()` looking for one whose attributes
@@ -1368,10 +1368,31 @@ fn register_handler_on(lp: &LocalParticipant, method: String, handler: RpcHandle
     lp.register_rpc_method(method, move |data| {
         let handler = handler.clone();
         Box::pin(async move {
-            let core_data: crate::rpc::RpcInvocationData = data.into();
-            handler(core_data).await.map_err(Into::into)
+            let core_data = rpc_invocation_from_sdk(data);
+            handler(core_data).await.map_err(rpc_error_to_sdk)
         })
     });
+}
+
+/// Conversions between the SDK's RPC types and the transport-agnostic core
+/// types, applied at the room boundary. These are free functions rather
+/// than `From` impls because neither side of the conversion is local to
+/// this crate (both now live in `livekit-portal-core` and the SDK).
+fn rpc_invocation_from_sdk(d: livekit::prelude::RpcInvocationData) -> RpcInvocationData {
+    RpcInvocationData {
+        request_id: d.request_id,
+        caller_identity: d.caller_identity.as_str().to_string(),
+        payload: d.payload,
+        response_timeout: d.response_timeout,
+    }
+}
+
+fn rpc_error_from_sdk(e: livekit::prelude::RpcError) -> RpcError {
+    RpcError { code: e.code, message: e.message, data: e.data }
+}
+
+fn rpc_error_to_sdk(e: RpcError) -> livekit::prelude::RpcError {
+    livekit::prelude::RpcError::new(e.code, e.message, e.data)
 }
 
 /// Snapshot of the fields the room event loop needs, so it doesn't take any

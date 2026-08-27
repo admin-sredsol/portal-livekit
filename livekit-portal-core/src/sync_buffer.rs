@@ -48,7 +48,7 @@ struct DropWarn {
 /// Result of a `push_frame` / `push_state` call. Callers dispatch these
 /// (invoke callbacks, enqueue into the pull-based buffer) *after* releasing
 /// the SyncBuffer lock so slow consumers don't stall the hot path.
-pub(crate) struct SyncOutput {
+pub struct SyncOutput {
     pub observations: Vec<Observation>,
     /// State samples that could not be matched to a video frame. Typed
     /// per the declared state schema, same shape as `Observation.state`.
@@ -87,7 +87,7 @@ struct MatchSlot {
     stale: bool,
 }
 
-pub(crate) struct SyncBuffer {
+pub struct SyncBuffer {
     track_names: Vec<String>,
     track_index: HashMap<String, usize>,
     // Parallel to `track_names`; indexed by track position.

@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SDK-facing Portal crate: LiveKit room orchestration on top of the
-//! transport-agnostic [`livekit-portal-core`](livekit_portal_core) crate.
+//! Transport-agnostic core of LiveKit Portal.
 //!
-//! The core modules are re-exported here unchanged, so every existing
-//! `livekit_portal::…` import path keeps working.
+//! Everything in this crate is free of LiveKit SDK, tokio I/O, and native
+//! (libwebrtc / libyuv) dependencies, so it builds for `wasm32-unknown-unknown`
+//! as well as all native targets. The SDK-facing orchestration lives in the
+//! `livekit-portal` crate, which re-exports these modules so downstream
+//! paths are unchanged.
 
-mod data;
-mod frame_video;
-mod portal;
-mod rtt;
-mod video;
-
-pub use livekit_portal_core::{
-    codec, config, config_file, dtype, error, metrics, rpc, serialization, sync_buffer, types,
-};
+pub mod codec;
+pub mod config;
+pub mod config_file;
+pub mod dtype;
+pub mod error;
+pub mod metrics;
+pub mod rpc;
+pub mod serialization;
+pub mod sync_buffer;
+pub mod types;
 
 pub use codec::Codec;
 pub use config::{
@@ -36,11 +39,9 @@ pub use config::{
 pub use config_file::ConfigFileError;
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
-pub use frame_video::BYTE_STREAM_CHUNK_SIZE;
 pub use metrics::{
     BufferMetrics, PolicyMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics,
 };
-pub use portal::{ACTIVE_OPERATOR_ATTR_KEY, Portal, ROLE_ATTR_KEY, SET_ACTIVE_OPERATOR_RPC};
 pub use rpc::{RpcError, RpcHandler, RpcInvocationData};
 pub use types::{
     Action, ActionChunk, ChunkColumn, Observation, Role, State, SyncConfig, TypedValue,

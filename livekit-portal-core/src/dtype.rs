@@ -66,7 +66,7 @@ impl DType {
     /// saturated, or `Bool` received `NaN`. `F64` never reports lossy. `F32`
     /// reports lossy only if the value is finite and outside `f32` range.
     /// Caller uses the flag to emit a rate-limited warning.
-    pub(crate) fn encode(self, v: f64, out: &mut Vec<u8>) -> bool {
+    pub fn encode(self, v: f64, out: &mut Vec<u8>) -> bool {
         match self {
             DType::F64 => {
                 out.extend_from_slice(&v.to_le_bytes());
@@ -116,7 +116,7 @@ impl DType {
     }
 
     /// Decode `buf[..self.size_bytes()]` into an `f64`.
-    pub(crate) fn decode(self, buf: &[u8]) -> PortalResult<f64> {
+    pub fn decode(self, buf: &[u8]) -> PortalResult<f64> {
         let need = self.size_bytes();
         if buf.len() < need {
             return Err(PortalError::Deserialization(format!(

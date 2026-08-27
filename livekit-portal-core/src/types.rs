@@ -294,7 +294,7 @@ impl Default for SyncConfig {
 /// Build `(typed, raw)` maps from an ordered schema and its values. Both
 /// maps are returned so delivery records can carry typed *and* raw views
 /// without rebuilding either on access.
-pub(crate) fn to_value_maps(
+pub fn to_value_maps(
     schema: &[FieldSpec],
     values: &[f64],
 ) -> (HashMap<String, TypedValue>, HashMap<String, f64>) {

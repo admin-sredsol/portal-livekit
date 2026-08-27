@@ -116,13 +116,13 @@ pub struct RttMetrics {
 const SAMPLE_RING_CAP: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DataStream {
+pub enum DataStream {
     State,
     Action,
     Chunk,
 }
 
-pub(crate) struct MetricsRegistry {
+pub struct MetricsRegistry {
     track_order: Vec<String>,
     per_track: HashMap<String, Arc<TrackMetrics>>,
 
@@ -368,7 +368,7 @@ impl MetricsRegistry {
     }
 }
 
-pub(crate) struct TrackMetrics {
+pub struct TrackMetrics {
     pub frames_sent: AtomicU64,
     pub frames_received: AtomicU64,
     pub evictions: AtomicU64,
@@ -436,7 +436,7 @@ impl TrackMetrics {
 }
 
 #[derive(Default)]
-pub(crate) struct JitterState {
+pub struct JitterState {
     last_send_ts: Option<u64>,
     last_recv_ts: Option<u64>,
     pub jitter_us: u64,
@@ -461,7 +461,7 @@ impl JitterState {
 
 /// Fixed-capacity ring of u64 samples for bounded-memory percentile/mean.
 /// Sort on read (O(N log N), N≤256) is cheap and keeps writes O(1).
-pub(crate) struct SampleRing {
+pub struct SampleRing {
     buf: Vec<u64>,
     cap: usize,
     idx: usize,

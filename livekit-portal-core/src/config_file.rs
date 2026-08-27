@@ -252,8 +252,18 @@ impl PortalConfig {
         session: impl Into<String>,
         role: Role,
     ) -> Result<Self, ConfigFileError> {
-        let text = std::fs::read_to_string(path)?;
-        Self::from_yaml_str(&text, session, role)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (path, session, role);
+            Err(ConfigFileError::Invalid(
+                "from_yaml_file reads the filesystem, which is unavailable on wasm; use from_yaml_str".to_string(),
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let text = std::fs::read_to_string(path)?;
+            Self::from_yaml_str(&text, session, role)
+        }
     }
 }
 

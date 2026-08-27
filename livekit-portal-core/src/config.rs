@@ -153,21 +153,21 @@ impl ChunkSpec {
 /// Configuration for a Portal session. Built incrementally before connecting.
 #[derive(Debug, Clone)]
 pub struct PortalConfig {
-    pub(crate) session: String,
-    pub(crate) role: Role,
-    pub(crate) video_tracks: Vec<VideoTrackSpec>,
-    pub(crate) frame_video_tracks: Vec<FrameVideoSpec>,
-    pub(crate) state_schema: Vec<FieldSpec>,
-    pub(crate) action_schema: Vec<FieldSpec>,
-    pub(crate) action_chunks: Vec<ChunkSpec>,
-    pub(crate) state_reliable: bool,
-    pub(crate) action_reliable: bool,
-    pub(crate) fps: u32,
-    pub(crate) slack: u32,
-    pub(crate) tolerance: f32,
-    pub(crate) ping_ms: u64,
-    pub(crate) reuse_stale_frames: bool,
-    pub(crate) shared_key: Option<Vec<u8>>,
+    pub session: String,
+    pub role: Role,
+    pub video_tracks: Vec<VideoTrackSpec>,
+    pub frame_video_tracks: Vec<FrameVideoSpec>,
+    pub state_schema: Vec<FieldSpec>,
+    pub action_schema: Vec<FieldSpec>,
+    pub action_chunks: Vec<ChunkSpec>,
+    pub state_reliable: bool,
+    pub action_reliable: bool,
+    pub fps: u32,
+    pub slack: u32,
+    pub tolerance: f32,
+    pub ping_ms: u64,
+    pub reuse_stale_frames: bool,
+    pub shared_key: Option<Vec<u8>>,
     /// Operator-side: subscribe to executed actions. Off by default —
     /// most operators are pure controllers and do not want the bandwidth
     /// or callback noise. Recorders, shadow eval policies, and live
@@ -180,7 +180,7 @@ pub struct PortalConfig {
     ///   * `send_action` / `send_action_chunk` echo a local copy after
     ///     publish when `local_identity == active_operator`, since
     ///     LiveKit does not fan out a publisher's own data packets
-    pub(crate) action_subscription: bool,
+    pub action_subscription: bool,
 }
 
 impl PortalConfig {
@@ -546,7 +546,7 @@ impl PortalConfig {
     }
 
     /// Derived sync config used internally by the sync buffer. Not public.
-    pub(crate) fn sync_config(&self) -> SyncConfig {
+    pub fn sync_config(&self) -> SyncConfig {
         let search_range_us = (self.tolerance * 1_000_000.0 / self.fps as f32) as u64;
         SyncConfig {
             video_buffer_size: self.slack,
