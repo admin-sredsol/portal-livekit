@@ -71,7 +71,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use crate::task::Task;
 
 use crate::codec::{Codec, decode_frame, encode_frame_into, estimated_encoded_size};
 use crate::config::FrameVideoSpec;
@@ -251,7 +251,7 @@ pub(crate) struct FrameVideoTrackEntry {
 pub(crate) struct FrameVideoPublisher {
     spec: FrameVideoSpec,
     tx: mpsc::Sender<Vec<u8>>,
-    task: Option<JoinHandle<()>>,
+    task: Option<Task>,
     metrics: Arc<TrackMetrics>,
 }
 
@@ -263,7 +263,7 @@ impl FrameVideoPublisher {
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUBLISH_QUEUE_CAP);
         let track_name = spec.name.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::task::spawn(async move {
             while let Some(payload) = rx.recv().await {
                 if let Err(e) = transport.send_bytes(payload, FRAME_VIDEO_TOPIC).await {
                     log::warn!(

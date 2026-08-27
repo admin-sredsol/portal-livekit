@@ -63,9 +63,17 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-/// Boxed future returned by an RPC handler.
+/// Boxed future returned by an RPC handler. `Send` on native targets,
+/// where handlers may run on multi-threaded executors; on wasm32 the JS
+/// event loop is single-threaded and JS-backed futures (`JsFuture` et al.)
+/// are not `Send`, so the bound is dropped (mirrors the split in
+/// [`crate::task`] and [`crate::transport::TransportFuture`]).
+#[cfg(not(target_arch = "wasm32"))]
 pub type RpcHandlerFuture =
     Pin<Box<dyn Future<Output = Result<String, RpcError>> + Send + 'static>>;
+
+#[cfg(target_arch = "wasm32")]
+pub type RpcHandlerFuture = Pin<Box<dyn Future<Output = Result<String, RpcError>> + 'static>>;
 
 /// RPC handler trait object stored on Portal. Cloned into the closure handed
 /// to the transport's `register_rpc_method` at connect time.

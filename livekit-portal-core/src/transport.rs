@@ -30,11 +30,13 @@
 //!
 //! # Threading
 //!
-//! Futures returned by the trait are `Send + 'static` so the Portal can
-//! drive them from `tokio::spawn`. On `wasm32` everything runs on a single
-//! thread; a JS transport should wrap its browser futures in a
-//! `Send`-asserting wrapper (e.g. `futures::future::Shared`-style or
-//! `SendWrapper`) when handing them to these methods.
+//! On native targets, futures returned by the trait are `Send + 'static`
+//! so the Portal can drive them from `tokio::spawn` on multi-threaded
+//! runtimes. On `wasm32` everything runs on the single-threaded JS event
+//! loop — `crate::task::spawn` maps to `spawn_local` there and needs no
+//! `Send` — and JS-backed futures (`JsFuture`) are not `Send` anyway, so
+//! [`TransportFuture`] drops the bound on that target (mirroring
+//! `RpcHandlerFuture`).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -55,8 +57,14 @@ use crate::types::VideoTrackSlots;
 
 /// Boxed future returned by every async transport method. Boxed (rather
 /// than `impl Future`) because `PortalTransport` is used as
-/// `Arc<dyn PortalTransport>`, which requires object safety.
+/// `Arc<dyn PortalTransport>`, which requires object safety. `Send` on
+/// native targets (see the Threading section); plain on wasm32, where the
+/// JS event loop is single-threaded and JS-backed futures are not `Send`.
+#[cfg(not(target_arch = "wasm32"))]
 pub type TransportFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+#[cfg(target_arch = "wasm32")]
+pub type TransportFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 
 /// Parameters for [`PortalTransport::connect`]. The Portal passes its event
 /// sink and the byte-stream topics it will consume at connect time so the

@@ -1,0 +1,31 @@
+[package]
+name = "livekit-portal-wasm"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# All functionality is wasm-only: js-sys / wasm-bindgen do not compile for
+# native targets, so every dependency and module is gated on
+# `target_arch = "wasm32"`. On native targets this crate is an empty stub,
+# which keeps `cargo check --workspace` green on the host while the browser
+# build exercises the real code.
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+livekit-portal-core = { path = "../livekit-portal-core" }
+# Event sink: core's channel types (already in core's tree; declared here
+# so this crate can name them directly).
+bytes = "1"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+parking_lot = { workspace = true }
+console_error_panic_hook = "0.1"
+wasm-logger = "0.2"
+log = { workspace = true }

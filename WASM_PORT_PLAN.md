@@ -3,22 +3,30 @@
 Assessment of this fork (clean clone of livekit/portal @ `999c118`) for compiling the Rust
 core to WebAssembly and making Portal usable from a browser operator UI.
 
-> **Status (updated after Phase 1).** Phases 0 and 1 are **done**, with one design
-> change from the sketch below: the native `LiveKitRustTransport` lives *inside*
-> `livekit-portal-core` behind a `native` cargo feature (not in the parent crate), and
-> the parent `livekit-portal` crate is now a thin facade that only enables that feature
-> and re-exports core. This keeps `Portal::connect(url, token)` as an inherent method
-> (so `livekit-portal-ffi` is untouched), and makes the future wasm build simply "core
-> with default features". Verified: `cargo check --workspace` (native) clean, 111 core
-> tests pass, clippy clean on lib targets, and
-> `cargo check/build -p livekit-portal-core --target wasm32-unknown-unknown`
-> (default features) clean. Core's tokio is `default-features = false` + `sync,rt`
-> (workspace inheritance can't override default-features, so it's declared directly);
-> the `native` feature adds `tokio/time` plus `livekit`, `yuv-sys`, `futures-util`.
-> Core now also owns `portal.rs` / `data.rs` / `frame_video.rs` / `rtt.rs` /
-> `video.rs` (git mv, history preserved) programmed against `PortalTransport`
-> (`transport.rs`), with `time.rs` (`now_us`, no tokio clock) and the `sleep()`
-> trait method replacing `tokio::time` in core.
+> **Status (updated after Phase 2).** Phases 0, 1, and 2 are **done**.
+>
+> - *Phases 0–1* moved the protocol core into `livekit-portal-core` with the native
+>   `LiveKitRustTransport` inside it behind a `native` cargo feature; the parent
+>   `livekit-portal` crate is a thin facade (FFI untouched), and a wasm build is
+>   simply "core with default features".
+> - *Phase 2* added three things to core: executor-agnostic task spawning
+>   (`task.rs` — `tokio::spawn` natively, `spawn_local` + `CancelToken` on wasm32),
+>   `Portal::ingest_video_frame` so a browser pushes decoded RGB frames through the
+>   same slots/sync-buffer/observation pipeline as the native receiver, and
+>   target-gated future bounds — `TransportFuture`/`RpcHandlerFuture` are `+ Send`
+>   only off-wasm (JS event loop is single-threaded and `JsFuture` isn't `Send`).
+>   New crate `livekit-portal-wasm` (cdylib + rlib, empty stub on native targets)
+>   exposes the JS seam: `WasmPortalConfig` builder mirroring the UniFFI surface,
+>   `WasmPortal` (connect/send_*/get_*/metrics/callbacks, all values as plain JS
+>   objects via `serde_wasm_bindgen`), `PortalEventSink` (JS→Rust inbound events +
+>   `invokeRpcMethod` promise dispatch), and the `JsTransport` contract the
+>   TypeScript adapter implements (13 camelCase methods mirroring `PortalTransport`).
+> - Verified: native `cargo check --workspace` clean; 117 core tests pass with
+>   `--features native` (incl. 6 new `ingest_video_frame` tests on a `FakeTransport`);
+>   `cargo check` + `cargo clippy` for `livekit-portal-core` +
+>   `livekit-portal-wasm` on `wasm32-unknown-unknown` clean.
+> - Next: Phase 3 — the TypeScript `LiveKitJsTransport` implementing the `JsTransport`
+>   contract over livekit-js, then Phase 4 packaging.
 
 ## 1. Verdict
 
@@ -158,20 +166,9 @@ for wasm builds; `rt-multi-thread` only in native builds (one `cfg` in the works
 dep table). Replace direct `tokio::time` in `rtt.rs`/`portal.rs` with an injected
 timer abstraction (native impl = tokio; wasm impl = futures-timer/gloo).
 
-**Phase 2 — wasm-bindgen crate (moderate).**
-New crate `livekit-portal-wasm` (cdylib, `wasm-pack build --target web`):
-- Mirror the UniFFI surface 1:1 — it's already the right shape: `PortalConfig`
-  builder (`add_video`, `add_state_typed`, `add_action_typed`, `add_action_chunk`,
-  `set_*`), `Portal` (`connect`, `send_video_frame`, `send_state`, `send_action`,
-  `send_action_chunk`, `set_active_operator`, `perform_rpc`, `get_*`, `metrics`).
-- `PortalCallbacks` (9 methods) becomes JS closures (`Closure<dyn FnMut(_)>`); tsify
-  emits TS types for `Observation`, `State`, `Action`, `ActionChunk`,
-  `VideoFrameData`, `PortalMetrics`.
-- Runtime: wasm-bindgen-futures; spawn_local or callback-driven tasks; single-threaded
-  is fine (the browser JS event loop replaces the tokio reactor; there is no
-  rt-multi-thread on wasm and none is needed).
-- E2EE: keep the shared-key GCM config in the core config; enforcement moves to
-  livekit-js (which supports E2EE) — note the parity risk below.
+**Phase 2 — wasm-bindgen crate (moderate). ✅ Done** (crate `livekit-portal-wasm`;
+hand-built JS conversions instead of tsify; callbacks registered as `js_sys::Function`
+closures; `PortalEventSink` carries inbound events + RPC dispatch to JS).
 
 **Phase 3 — TS transport adapter (few hundred lines).**
 `LiveKitJsTransport implements PortalTransport` over livekit-js:

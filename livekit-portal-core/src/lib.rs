@@ -51,6 +51,7 @@ mod data;
 mod frame_video;
 pub mod portal;
 mod rtt;
+mod task;
 
 // SDK- and libwebrtc-facing modules, native targets only.
 #[cfg(feature = "native")]

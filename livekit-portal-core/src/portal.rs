@@ -27,8 +27,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use crate::task::Task;
 
 use crate::config::{ChunkSpec, FieldSpec, PortalConfig};
 use crate::data::{
@@ -250,7 +251,7 @@ impl ObservationSink {
 }
 
 struct ConnectionState {
-    event_task: Option<JoinHandle<()>>,
+    event_task: Option<Task>,
     rtt: Option<Arc<RttService>>,
 }
 
@@ -578,7 +579,7 @@ impl Portal {
             local_identity,
             transport: transport.clone(),
         };
-        let event_handle = tokio::spawn(async move {
+        let event_handle = crate::task::spawn(async move {
             while let Some(event) = events_rx.recv().await {
                 handle_room_event(&ctx, event);
             }
@@ -1229,6 +1230,98 @@ impl Portal {
         }
     }
 
+    /// Operator-side, browser video path: push one decoded RGB frame into the
+    /// same slots / sync-buffer / observation pipeline the native receivers
+    /// feed.
+    ///
+    /// Native transports own the whole receive pipeline — libwebrtc decodes,
+    /// yuv converts, a receiver task pushes. In the browser there is no
+    /// libwebrtc; the JS side subscribes with livekit-js, decodes frames
+    /// itself (canvas / WebCodecs), and hands the RGB here. Portal routes it
+    /// exactly like a native receiver would: per-frame callback, latest-wins
+    /// slot for `get_video_frame`, sync-buffer push (which fires
+    /// `on_observation` when state pairs with the frame), and track metrics.
+    ///
+    /// Frame-video byte-stream arrivals do not go through this method — the
+    /// JS transport forwards finished streams as `TransportEvent::ByteStream`
+    /// and `dispatch_frame_payload` decodes them in core. This entry point is
+    /// for WebRTC media-path tracks, declared under either `video_tracks` or
+    /// `frame_video_tracks` (a robot may publish a declared frame-video track
+    /// as real media; the codec in its spec is irrelevant to this path).
+    ///
+    /// `rgb` is packed RGB24 (`width * height * 3` bytes). Requires a
+    /// connected operator; the sync buffer does not exist before connect.
+    pub fn ingest_video_frame(
+        &self,
+        track_name: &str,
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
+        timestamp_us: u64,
+    ) -> PortalResult<()> {
+        if self.config.role != Role::Operator {
+            return Err(PortalError::WrongRole(self.config.role));
+        }
+
+        // Buffer-length check with overflow-safe math: a u32 product can
+        // overflow a 32-bit `usize` on wasm32 (checked math saturates the
+        // pathological case into `InvalidFrameDimensions`).
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(3));
+        let expected = match expected {
+            Some(n) => n,
+            None => return Err(PortalError::InvalidFrameDimensions { width, height }),
+        };
+        if rgb.len() != expected {
+            return Err(PortalError::WrongFrameSize { expected, got: rgb.len() });
+        }
+
+        // `video_tracks` holds slots for every declared track name — WebRTC
+        // and frame-video alike (see `Portal::new`) — so one lookup resolves
+        // either kind, and metrics are registered for the same name set.
+        let slots = self
+            .video_tracks
+            .get(track_name)
+            .ok_or_else(|| PortalError::UnknownVideoTrack { name: track_name.to_string() })?
+            .clone();
+        let metrics =
+            self.metrics.track(track_name).expect("track metrics registered at construction");
+
+        let sync_buffer =
+            self.sync_buffer.lock().clone().ok_or(PortalError::NotConnected)?;
+
+        let frame = Arc::new(VideoFrameData {
+            width,
+            height,
+            data: Bytes::from(rgb),
+            timestamp_us,
+        });
+        metrics.record_received_bytes(timestamp_us, now_us(), frame.data.len());
+
+        // Everything below mirrors the native receive paths' tail (video.rs
+        // processing task / `dispatch_frame_payload`): panic-isolated
+        // callback, latest-wins slot, sync-buffer push + observation
+        // dispatch. Synchronous — the JS side calls this once per decoded
+        // frame, so no queue or drainer task is needed.
+        if let Some(cb) = slots.cb.lock().as_ref() {
+            let result = catch_unwind(AssertUnwindSafe(|| cb(track_name, &frame)));
+            if result.is_err() {
+                log::error!(
+                    "[callback-panic] video frame callback panicked on track '{track_name}', \
+                     receive loop continues"
+                );
+            }
+        }
+        *slots.latest.lock() = Some((*frame).clone());
+
+        let output = sync_buffer.lock().push_frame(track_name, frame);
+        if !output.is_empty() {
+            self.obs_sink.dispatch(output);
+        }
+        Ok(())
+    }
+
     /// Fire on every batch of state samples that couldn't be matched to a
     /// video frame. Each entry is the typed state payload (same shape as
     /// `Observation.state`).
@@ -1674,5 +1767,188 @@ fn handle_room_event(ctx: &EventContext, event: TransportEvent) {
             // robot side across any transient reconnect.
             ctx.controller.clear_for_reconnect();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::Codec;
+    use crate::config::{FrameVideoSpec, VideoTrackSpec};
+    use crate::transport::{
+        PortalTransport, ParticipantInfo, TransportConnect, TransportFuture, TransportRpcRequest,
+        VideoReceiverHandle, VideoSink,
+    };
+    use std::time::Duration;
+
+    /// Minimal in-crate transport: every method is a no-op that succeeds.
+    /// Enough to drive `connect_with_transport` through an operator's setup
+    /// (no publishers to build) so `ingest_video_frame`'s happy path is
+    /// reachable in tests; inbound events never fire because the fake never
+    /// sends any.
+    struct FakeTransport;
+
+    impl PortalTransport for FakeTransport {
+        fn connect(&self, _params: TransportConnect<'_>) -> TransportFuture<PortalResult<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn disconnect(&self) -> TransportFuture<PortalResult<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn publish_data(
+            &self,
+            _payload: Vec<u8>,
+            _topic: Option<String>,
+            _reliable: bool,
+        ) -> TransportFuture<PortalResult<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn send_bytes(&self, _payload: Vec<u8>, _topic: &str) -> TransportFuture<PortalResult<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn set_attributes(
+            &self,
+            _attrs: HashMap<String, String>,
+        ) -> TransportFuture<PortalResult<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn perform_rpc(
+            &self,
+            _request: TransportRpcRequest,
+        ) -> TransportFuture<Result<String, RpcError>> {
+            Box::pin(std::future::ready(Err(RpcError::new(1, "fake: no rpc", None))))
+        }
+
+        fn register_rpc_method(&self, _method: String, _handler: RpcHandler) {}
+
+        fn unregister_rpc_method(&self, _method: &str) {}
+
+        fn local_identity(&self) -> Option<String> {
+            Some("op-1".to_string())
+        }
+
+        fn local_attributes(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+
+        fn remote_participants(&self) -> Vec<ParticipantInfo> {
+            Vec::new()
+        }
+
+        fn start_video_receiver(
+            &self,
+            _track_name: &str,
+            _sink: VideoSink,
+        ) -> Option<Box<dyn VideoReceiverHandle>> {
+            None
+        }
+
+        fn publish_video_frame(
+            &self,
+            _track_name: &str,
+            _rgb: &[u8],
+            _width: u32,
+            _height: u32,
+            _timestamp_us: Option<u64>,
+        ) -> PortalResult<()> {
+            Ok(())
+        }
+
+        fn sleep(&self, _duration: Duration) -> TransportFuture<()> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    fn operator_config() -> PortalConfig {
+        let mut config = PortalConfig::new("test", Role::Operator);
+        // No RTT pinger: the fake's `sleep` is always-ready, and a ping loop
+        // against it would spin the single-threaded test runtime.
+        config.ping_ms = 0;
+        config
+    }
+
+    fn rgb(w: u32, h: u32) -> Vec<u8> {
+        vec![0u8; (w * h * 3) as usize]
+    }
+
+    #[tokio::test]
+    async fn ingest_routes_frame_through_slots_and_callback() {
+        let mut config = operator_config();
+        config.video_tracks.push(VideoTrackSpec::new("cam", Codec::Raw, None, false, false));
+        let portal = Portal::new(config);
+
+        let got = Arc::new(Mutex::new(None::<VideoFrameData>));
+        let got_cb = got.clone();
+        portal.on_video_frame("cam", move |name, frame| {
+            assert_eq!(name, "cam");
+            *got_cb.lock() = Some(frame.clone());
+        });
+
+        portal
+            .connect_with_transport(Arc::new(FakeTransport), "ws://test", "tok")
+            .await
+            .unwrap();
+        portal.ingest_video_frame("cam", rgb(8, 8), 8, 8, 12_345).unwrap();
+
+        let latest = portal.get_video_frame("cam").expect("latest slot updated");
+        assert_eq!((latest.width, latest.height), (8, 8));
+        assert_eq!(latest.timestamp_us, 12_345);
+        assert_eq!(latest.data.len(), 8 * 8 * 3);
+        let cb_frame = got.lock().clone().expect("callback fired");
+        assert_eq!(cb_frame.timestamp_us, 12_345);
+    }
+
+    #[tokio::test]
+    async fn ingest_accepts_frame_video_track_names() {
+        let mut config = operator_config();
+        config.frame_video_tracks.push(FrameVideoSpec::new("fv", Codec::Raw, 0));
+        let portal = Portal::new(config);
+
+        portal
+            .connect_with_transport(Arc::new(FakeTransport), "ws://test", "tok")
+            .await
+            .unwrap();
+        portal.ingest_video_frame("fv", rgb(4, 4), 4, 4, 7).unwrap();
+        assert_eq!(portal.get_video_frame("fv").unwrap().timestamp_us, 7);
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_wrong_role() {
+        let mut config = PortalConfig::new("test", Role::Robot);
+        config.ping_ms = 0;
+        config.video_tracks.push(VideoTrackSpec::new("cam", Codec::Raw, None, false, false));
+        let portal = Portal::new(config);
+        let err = portal.ingest_video_frame("cam", rgb(8, 8), 8, 8, 0).unwrap_err();
+        assert!(matches!(err, PortalError::WrongRole(Role::Robot)));
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_wrong_frame_size() {
+        let mut config = operator_config();
+        config.video_tracks.push(VideoTrackSpec::new("cam", Codec::Raw, None, false, false));
+        let portal = Portal::new(config);
+        let err = portal.ingest_video_frame("cam", vec![0u8; 10], 8, 8, 0).unwrap_err();
+        assert!(matches!(err, PortalError::WrongFrameSize { expected: 192, got: 10 }));
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_unknown_track() {
+        let portal = Portal::new(operator_config());
+        let err = portal.ingest_video_frame("nope", rgb(8, 8), 8, 8, 0).unwrap_err();
+        assert!(matches!(err, PortalError::UnknownVideoTrack { ref name } if name == "nope"));
+    }
+
+    #[tokio::test]
+    async fn ingest_requires_connect() {
+        let mut config = operator_config();
+        config.video_tracks.push(VideoTrackSpec::new("cam", Codec::Raw, None, false, false));
+        let portal = Portal::new(config);
+        let err = portal.ingest_video_frame("cam", rgb(8, 8), 8, 8, 0).unwrap_err();
+        assert!(matches!(err, PortalError::NotConnected));
     }
 }

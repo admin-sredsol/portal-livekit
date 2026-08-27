@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use crate::task::Task;
 
 use crate::metrics::MetricsRegistry;
 use crate::time::now_us;
@@ -41,8 +41,8 @@ const RTT_QUEUE_CAP: usize = 64;
 /// `MissedTickBehavior::Delay`), which is fine for a 1Hz best-effort probe.
 pub(crate) struct RttService {
     tx: mpsc::Sender<Vec<u8>>,
-    ping_task: Option<JoinHandle<()>>,
-    send_task: Option<JoinHandle<()>>,
+    ping_task: Option<Task>,
+    send_task: Option<Task>,
     metrics: Arc<MetricsRegistry>,
 }
 
@@ -55,7 +55,7 @@ impl RttService {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(RTT_QUEUE_CAP);
 
         let transport_send = transport.clone();
-        let send_task = tokio::spawn(async move {
+        let send_task = crate::task::spawn(async move {
             while let Some(payload) = rx.recv().await {
                 if let Err(e) =
                     transport_send.publish_data(payload, Some(RTT_TOPIC.to_string()), false).await
@@ -68,7 +68,7 @@ impl RttService {
         let ping_task = if ping_interval_ms > 0 {
             let tx_ping = tx.clone();
             let metrics_ping = metrics.clone();
-            Some(tokio::spawn(async move {
+            Some(crate::task::spawn(async move {
                 loop {
                     transport.sleep(Duration::from_millis(ping_interval_ms)).await;
                     let ts = now_us();

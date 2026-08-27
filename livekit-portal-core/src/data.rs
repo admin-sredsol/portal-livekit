@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use crate::task::Task;
 
 use crate::config::{ChunkSpec, FieldSpec};
 use crate::error::{PortalError, PortalResult};
@@ -78,7 +78,7 @@ pub(crate) struct DataPublisher {
     topic: String,
     reliable: bool,
     tx: mpsc::Sender<OutboundPacket>,
-    task: Option<JoinHandle<()>>,
+    task: Option<Task>,
     metrics: Arc<MetricsRegistry>,
     stream: DataStream,
     // Per-field snapshot of the last sent value, stored as f64 for lossless
@@ -105,7 +105,7 @@ impl DataPublisher {
         stream: DataStream,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<OutboundPacket>(PUBLISH_QUEUE_CAP);
-        let task = tokio::spawn(async move {
+        let task = crate::task::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 if let Err(e) =
                     transport.publish_data(packet.payload, packet.topic, packet.reliable).await
@@ -452,7 +452,7 @@ pub(crate) struct ChunkPublisher {
     spec: ChunkSpec,
     fingerprint: u32,
     tx: mpsc::Sender<Vec<u8>>,
-    task: Option<JoinHandle<()>>,
+    task: Option<Task>,
     metrics: Arc<MetricsRegistry>,
     /// `(t, field_index)` pairs already warned. Kept as flat indices —
     /// matches `serialize_chunk`'s output channel.
@@ -472,7 +472,7 @@ impl ChunkPublisher {
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PUBLISH_QUEUE_CAP);
         let chunk_name = spec.name.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::task::spawn(async move {
             while let Some(payload) = rx.recv().await {
                 if let Err(e) = transport.send_bytes(payload, ACTION_CHUNK_TOPIC).await {
                     log::warn!("[publish-failed] chunk '{chunk_name}' byte stream failed: {e}");

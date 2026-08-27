@@ -37,3 +37,8 @@ native = ["dep:livekit", "dep:yuv-sys", "dep:futures-util", "tokio/time"]
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Drives core's internal tasks (publisher drainers, RTT service, event loop)
+# on the JS event loop; natively those are tokio::spawn tasks (see task.rs).
+wasm-bindgen-futures = "0.4"
