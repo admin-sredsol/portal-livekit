@@ -1,0 +1,65 @@
+name: wasm
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm:
+    name: wasm32 build + node smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: livekit-portal-wasm/npm
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The wasm32 build of the workspace needs none of the LINUX_SYSTEM_DEPS
+      # the native jobs install: the `native` feature (libwebrtc, yuv-sys) is
+      # off, so only pure-Rust crates compile on this target.
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: wasm32-unknown-unknown
+
+      # wasm-bindgen's CLI and the crate it processes must be the same
+      # version. Take it from Cargo.lock rather than hardcoding, so a
+      # dependency bump can never desync the two.
+      - name: Install wasm-bindgen-cli (version locked to Cargo.lock)
+        working-directory: .
+        run: |
+          WBG_VERSION=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = "|"$/, ""); print; exit}' Cargo.lock)
+          echo "Installing wasm-bindgen-cli $WBG_VERSION"
+          cargo install wasm-bindgen-cli --version "$WBG_VERSION" --locked
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # Two installs: npm/ provides the `tsc` binary for the build script,
+      # ts/ provides the livekit-client types the adapter source resolves
+      # against (see npm/build.mjs).
+      - name: Install npm dependencies
+        run: |
+          npm install
+          npm install --prefix ../ts
+
+      - name: Build package (cargo + wasm-bindgen + tsc)
+        run: npm run build
+
+      - name: Clippy (wasm32 target)
+        run: cargo clippy -p livekit-portal-wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: Typecheck adapter source
+        run: npm run typecheck
+
+      - name: Smoke test (two wasm Portals over a mock JsTransport)
+        run: npm test

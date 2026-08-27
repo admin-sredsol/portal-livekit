@@ -3,8 +3,11 @@
 Assessment of this fork (clean clone of livekit/portal @ `999c118`) for compiling the Rust
 core to WebAssembly and making Portal usable from a browser operator UI.
 
-> **Status (updated after Phase 3).** Phases 0–3 are **done**; Phase 4
-> (packaging & CI) remains.
+> **Status (updated after Phase 4).** All four phases — 0 through 4 — are
+> **done**. The browser port is complete: `npm run build` in
+> `livekit-portal-wasm/npm` produces the publishable package, and the
+> `wasm` GitHub Actions workflow builds it and runs the smoke test on every
+> push/PR.
 >
 > - *Phases 0–1* moved the protocol core into `livekit-portal-core` with the native
 >   `LiveKitRustTransport` inside it behind a `native` cargo feature; the parent
@@ -34,7 +37,22 @@ core to WebAssembly and making Portal usable from a browser operator UI.
 >   and embedder-driven decode into `ingestVideoFrame` on the receive side.
 > - Verified: `tsc --noEmit` strict against livekit-client's own type
 >   declarations (TS 5.9); wasm crate doc-only change after.
-> - Next: Phase 4 — packaging & CI.
+> - *Phase 4* added the npm package (`livekit-portal-wasm/npm/`) and CI. A
+>   Node end-to-end smoke test (`npm/test/smoke.mjs`) drives two wasm
+>   `WasmPortal`s — a robot and an operator — through a mock `JsTransport`
+>   pair: role classification via attributes, state publish → receive,
+>   RPC both directions with the error wire shape, frame-video byte
+>   streams, `ingestVideoFrame`, and metrics. The smoke test caught four
+>   real bugs pre-commit (see Phase 4 section). The published surface
+>   keeps wasm-bindgen's generated `.d.ts`; all u64 values (timestamps,
+>   RTT, counters) cross as f64 Numbers, not BigInt.
+> - Verified: smoke test green; native `cargo check --workspace` + 117
+>   core tests + wasm32 clippy (`-D warnings`) still clean after the
+>   fixes; full `npm run build` → `npm test` → `require()` path exercised.
+> - CI: `.github/workflows/wasm.yml` — wasm32 target, wasm-bindgen-cli
+>   version-locked to `Cargo.lock`, package build, wasm32 clippy, adapter
+>   typecheck, and the smoke test, pinned to the same action SHAs as
+>   `tests.yml`.
 
 ## 1. Verdict
 
@@ -198,10 +216,31 @@ on duplicate registration; and `startVideoReceiver` must NOT re-notify the
 sink — core already dispatched the `VideoTrackSubscribed` event before
 calling it, so a re-notify would loop the event channel.
 
-**Phase 4 — packaging & CI.**
-`wasm-pack` → npm package (ESM, web target); GitHub Actions job adding
-`wasm32-unknown-unknown` build + a browser smoke test (two synthetic Portal peers via
-LiveKit Cloud sandbox or a mock transport).
+**Phase 4 — packaging & CI. ✅ Done.**
+The plan's `wasm-pack` was swapped for plain `cargo build` + `wasm-bindgen`
+(same output; `wasm-pack`'s packing step fights a cargo workspace and adds
+nothing here) — `livekit-portal-wasm/npm/` holds the publishable package:
+`package.json` (no `"type"` field on purpose: the wasm-bindgen `nodejs`
+artifact is CommonJS while `web` is ESM, so dist/node loads as CJS with
+standard named-export interop and bundlers take dist/web by syntax; the
+transport adapter is compiled to `.mjs` to stay ESM everywhere),
+`build.mjs` (release cdylib → wasm-bindgen `--target web`/`--target nodejs`
+→ `tsc` compile of `../ts/livekit-js-transport.ts`; requires npm installs
+in both `npm/` and `../ts/` — the latter provides the livekit-client types
+the adapter resolves), and `test/smoke.mjs`. The smoke test runs two wasm
+`WasmPortal`s (robot + operator) through a mock `JsTransport` room in one
+Node process and caught four real bugs pre-commit: the JS surface was
+snake_case (missing `js_name` attrs), `serde_wasm_bindgen` serialized
+`setAttributes` maps as JS `Map`s where the contract (and livekit-js)
+wants plain objects, `SystemTime::now()` panics on wasm32 (core's
+`now_us` is now `js_sys::Date::now()` there), and every u64 crossed as a
+BigInt (timestamps/RTT/counters are f64 Numbers now). CI:
+`.github/workflows/wasm.yml` runs the wasm32 build, wasm-bindgen-cli
+pinned to the `Cargo.lock` version, wasm32 clippy with `-D warnings`,
+adapter typecheck, and the smoke test — the "browser smoke test" option
+of running two synthetic peers over LiveKit Cloud stays available later;
+the mock transport already exercises the identical seam without network
+flakiness.
 
 ## 6. Browser-friendly concerns & risks
 

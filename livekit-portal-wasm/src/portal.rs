@@ -76,7 +76,7 @@ fn video_frame_to_js(frame: &VideoFrameData) -> JsValue {
     let obj = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&obj, &"width".into(), &frame.width.into());
     let _ = js_sys::Reflect::set(&obj, &"height".into(), &frame.height.into());
-    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &frame.timestamp_us.into());
+    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &(frame.timestamp_us as f64).into());
     let _ = js_sys::Reflect::set(&obj, &"data".into(), &js_sys::Uint8Array::from(&frame.data[..]).into());
     obj.into()
 }
@@ -102,9 +102,9 @@ fn action_to_js(action: &Action) -> JsValue {
         &"rawValues".into(),
         &map_to_js(&action.raw_values, |v| JsValue::from(*v)),
     );
-    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &action.timestamp_us.into());
+    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &(action.timestamp_us as f64).into());
     let in_reply = match action.in_reply_to_ts_us {
-        Some(ts) => ts.into(),
+        Some(ts) => (ts as f64).into(),
         None => JsValue::NULL,
     };
     let _ = js_sys::Reflect::set(&obj, &"inReplyToTsUs".into(), &in_reply);
@@ -124,7 +124,7 @@ fn state_to_js(state: &State) -> JsValue {
         &"rawValues".into(),
         &map_to_js(&state.raw_values, |v| JsValue::from(*v)),
     );
-    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &state.timestamp_us.into());
+    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &(state.timestamp_us as f64).into());
     obj.into()
 }
 
@@ -145,7 +145,7 @@ fn observation_to_js(obs: &Observation) -> JsValue {
         let _ = js_sys::Reflect::set(&frames, &JsString::from(name.as_str()), &video_frame_to_js(frame));
     }
     let _ = js_sys::Reflect::set(&obj, &"frames".into(), &frames.into());
-    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &obs.timestamp_us.into());
+    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &(obs.timestamp_us as f64).into());
     obj.into()
 }
 
@@ -159,9 +159,9 @@ fn action_chunk_to_js(chunk: &ActionChunk) -> JsValue {
         let _ = js_sys::Reflect::set(&columns, &JsString::from(name.as_str()), &arr.into());
     }
     let _ = js_sys::Reflect::set(&obj, &"data".into(), &columns.into());
-    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &chunk.timestamp_us.into());
+    let _ = js_sys::Reflect::set(&obj, &"timestampUs".into(), &(chunk.timestamp_us as f64).into());
     let in_reply = match chunk.in_reply_to_ts_us {
-        Some(ts) => ts.into(),
+        Some(ts) => (ts as f64).into(),
         None => JsValue::NULL,
     };
     let _ = js_sys::Reflect::set(&obj, &"inReplyToTsUs".into(), &in_reply);
@@ -176,65 +176,69 @@ fn metrics_to_js(metrics: &PortalMetrics) -> JsValue {
     // are summed; the maps stay reachable through core for consumers who
     // need per-track detail.
     let sum = |m: &HashMap<String, u64>| m.values().sum::<u64>();
+    // Counters are Numbers, not BigInt: u64 → f64 is exact up to 2^53,
+    // far past any realistic metric value, and JS dashboards expect
+    // plain numbers.
+    let num = |v: u64| -> JsValue { (v as f64).into() };
     let obj = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
         &obj,
         &"observationsEmitted".into(),
-        &metrics.sync.observations_emitted.into(),
+        &num(metrics.sync.observations_emitted),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"staleObservationsEmitted".into(),
-        &metrics.sync.stale_observations_emitted.into(),
+        &num(metrics.sync.stale_observations_emitted),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"statesDropped".into(),
-        &metrics.sync.states_dropped.into(),
+        &num(metrics.sync.states_dropped),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"bytesSent".into(),
-        &sum(&metrics.transport.bytes_sent).into(),
+        &num(sum(&metrics.transport.bytes_sent)),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"bytesReceived".into(),
-        &sum(&metrics.transport.bytes_received).into(),
+        &num(sum(&metrics.transport.bytes_received)),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"statesSent".into(),
-        &metrics.transport.states_sent.into(),
+        &num(metrics.transport.states_sent),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"statesReceived".into(),
-        &metrics.transport.states_received.into(),
+        &num(metrics.transport.states_received),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"actionsSent".into(),
-        &metrics.transport.actions_sent.into(),
+        &num(metrics.transport.actions_sent),
     );
     let _ = js_sys::Reflect::set(
         &obj,
         &"actionsReceived".into(),
-        &metrics.transport.actions_received.into(),
+        &num(metrics.transport.actions_received),
     );
-    let _ = js_sys::Reflect::set(&obj, &"pingsSent".into(), &metrics.rtt.pings_sent.into());
+    let _ = js_sys::Reflect::set(&obj, &"pingsSent".into(), &num(metrics.rtt.pings_sent));
     let _ = js_sys::Reflect::set(
         &obj,
         &"pongsReceived".into(),
-        &metrics.rtt.pongs_received.into(),
+        &num(metrics.rtt.pongs_received),
     );
     let rtt_mean = match metrics.rtt.rtt_us_mean {
-        Some(v) => v.into(),
+        Some(v) => (v as f64).into(),
         None => JsValue::NULL,
     };
     let _ = js_sys::Reflect::set(&obj, &"rttUsMean".into(), &rtt_mean);
     let rtt_p95 = match metrics.rtt.rtt_us_p95 {
-        Some(v) => v.into(),
+        Some(v) => (v as f64).into(),
         None => JsValue::NULL,
     };
     let _ = js_sys::Reflect::set(&obj, &"rttUsP95".into(), &rtt_p95);
@@ -293,6 +297,7 @@ impl WasmPortal {
     /// Connect through a JS-implemented transport. `transport` must
     /// implement the `JsTransport` contract (see the module docs of
     /// `transport`).
+    #[wasm_bindgen(js_name = "connect")]
     pub async fn connect(
         &self,
         transport: crate::transport::JsTransportObject,
@@ -306,6 +311,7 @@ impl WasmPortal {
             .map_err(js_error_from_portal)
     }
 
+    #[wasm_bindgen(js_name = "disconnect")]
     pub async fn disconnect(&self) -> Result<(), wasm_bindgen::JsError> {
         self.inner.disconnect().await.map_err(js_error_from_portal)
     }
@@ -315,6 +321,7 @@ impl WasmPortal {
     /// Publish state (robot only). `values` is `{fieldName: number|bool}`
     /// per the declared state schema; missing fields are omitted samples.
     /// `timestampUs` defaults to now.
+    #[wasm_bindgen(js_name = "sendState")]
     pub fn send_state(
         &self,
         values: JsValue,
@@ -327,6 +334,7 @@ impl WasmPortal {
     /// Publish an action (operator only). Same shape as `sendState`, plus
     /// `inReplyToTsUs` — the observation timestamp this action answers,
     /// feeding end-to-end policy latency metrics.
+    #[wasm_bindgen(js_name = "sendAction")]
     pub fn send_action(
         &self,
         values: JsValue,
@@ -342,6 +350,7 @@ impl WasmPortal {
     /// Publish an action chunk (operator only). `data` is
     /// `{fieldName: number[]}` — columns are padded/truncated to the
     /// declared horizon.
+    #[wasm_bindgen(js_name = "sendActionChunk")]
     pub fn send_action_chunk(
         &self,
         chunk_name: &str,
@@ -365,6 +374,7 @@ impl WasmPortal {
     /// native robots publishing real media — in a browser deployment the
     /// robot side almost always uses `sendFrameVideo`-style byte streams
     /// or stays native). `rgb` is packed RGB24.
+    #[wasm_bindgen(js_name = "sendVideoFrame")]
     pub fn send_video_frame(
         &self,
         track_name: &str,
@@ -381,6 +391,7 @@ impl WasmPortal {
     /// Operator-side video ingest: push one decoded RGB frame (canvas /
     /// WebCodecs output) into Portal's sync pipeline. `rgb` is packed
     /// RGB24, `width * height * 3` bytes.
+    #[wasm_bindgen(js_name = "ingestVideoFrame")]
     pub fn ingest_video_frame(
         &self,
         track_name: &str,
@@ -396,18 +407,22 @@ impl WasmPortal {
 
     // --- Pull API (latest-wins) ---
 
+    #[wasm_bindgen(js_name = "getObservation")]
     pub fn get_observation(&self) -> JsValue {
         self.inner.get_observation().map(|o| observation_to_js(&o)).unwrap_or(JsValue::NULL)
     }
 
+    #[wasm_bindgen(js_name = "getAction")]
     pub fn get_action(&self) -> JsValue {
         self.inner.get_action().map(|a| action_to_js(&a)).unwrap_or(JsValue::NULL)
     }
 
+    #[wasm_bindgen(js_name = "getState")]
     pub fn get_state(&self) -> JsValue {
         self.inner.get_state().map(|s| state_to_js(&s)).unwrap_or(JsValue::NULL)
     }
 
+    #[wasm_bindgen(js_name = "getVideoFrame")]
     pub fn get_video_frame(&self, track_name: String) -> JsValue {
         self.inner
             .get_video_frame(&track_name)
@@ -415,6 +430,7 @@ impl WasmPortal {
             .unwrap_or(JsValue::NULL)
     }
 
+    #[wasm_bindgen(js_name = "getActionChunk")]
     pub fn get_action_chunk(&self, chunk_name: String) -> JsValue {
         self.inner
             .get_action_chunk(&chunk_name)
@@ -424,28 +440,34 @@ impl WasmPortal {
 
     // --- Queries ---
 
+    #[wasm_bindgen(js_name = "localIdentity")]
     pub fn local_identity(&self) -> Option<String> {
         self.inner.local_identity()
     }
 
+    #[wasm_bindgen(js_name = "activeOperator")]
     pub fn active_operator(&self) -> Option<String> {
         self.inner.active_operator()
     }
 
+    #[wasm_bindgen(js_name = "operators")]
     pub fn operators(&self) -> Vec<String> {
         self.inner.operators()
     }
 
+    #[wasm_bindgen(js_name = "actionChunks")]
     pub fn action_chunks(&self) -> Vec<String> {
         self.inner.action_chunks().iter().map(|s| s.name.clone()).collect()
     }
 
+    #[wasm_bindgen(js_name = "metrics")]
     pub fn metrics(&self) -> JsValue {
         metrics_to_js(&self.inner.metrics())
     }
 
     // --- Multi-controller ---
 
+    #[wasm_bindgen(js_name = "setActiveOperator")]
     pub async fn set_active_operator(&self, identity: Option<String>) -> Result<(), wasm_bindgen::JsError> {
         self.inner.set_active_operator(identity).await.map_err(js_error_from_portal)
     }
@@ -455,25 +477,32 @@ impl WasmPortal {
     /// Invoke a remote RPC. `destination` may be `null` to resolve the
     /// peer automatically (robot for an operator and vice versa).
     /// `responseTimeoutMs` may be `null` for the transport default.
+    #[wasm_bindgen(js_name = "performRpc")]
     pub async fn perform_rpc(
         &self,
         destination: Option<String>,
         method: String,
         payload: String,
         response_timeout_ms: Option<f64>,
-    ) -> Result<String, wasm_bindgen::JsError> {
+    ) -> Result<String, JsValue> {
         let response_timeout =
             response_timeout_ms.map(|ms| Duration::from_millis(ms.max(0.0) as u64));
         self.inner
             .perform_rpc(destination.as_deref(), &method, payload, response_timeout)
             .await
-            .map_err(js_error_from_portal)
+            .map_err(|error| match &error {
+                livekit_portal_core::error::PortalError::Rpc(rpc_error) => {
+                    rpc_error_to_js_error(rpc_error.clone())
+                }
+                _ => js_error_from_portal(error).into(),
+            })
     }
 
     /// Register a handler for inbound RPC `method`. The JS function
     /// receives `{requestId, callerIdentity, payload, responseTimeoutMs}`
     /// and must return a promise resolving to the string result (or
     /// rejecting with `{code, message, data}`).
+    #[wasm_bindgen(js_name = "registerRpcMethod")]
     pub fn register_rpc_method(
         &self,
         method: &str,
@@ -508,36 +537,42 @@ impl WasmPortal {
         self.inner.register_rpc_method(method, wrapped);
     }
 
+    #[wasm_bindgen(js_name = "unregisterRpcMethod")]
     pub fn unregister_rpc_method(&self, method: &str) {
         self.inner.unregister_rpc_method(method);
     }
 
     // --- Callback registration (push API) ---
 
+    #[wasm_bindgen(js_name = "onObservation")]
     pub fn on_observation(&self, callback: js_sys::Function) {
         self.inner.on_observation(move |obs| {
             let _ = callback.call1(&JsValue::NULL, &observation_to_js(obs));
         });
     }
 
+    #[wasm_bindgen(js_name = "onAction")]
     pub fn on_action(&self, callback: js_sys::Function) {
         self.inner.on_action(move |action| {
             let _ = callback.call1(&JsValue::NULL, &action_to_js(action));
         });
     }
 
+    #[wasm_bindgen(js_name = "onState")]
     pub fn on_state(&self, callback: js_sys::Function) {
         self.inner.on_state(move |state| {
             let _ = callback.call1(&JsValue::NULL, &state_to_js(state));
         });
     }
 
+    #[wasm_bindgen(js_name = "onActionChunk")]
     pub fn on_action_chunk(&self, chunk_name: &str, callback: js_sys::Function) {
         self.inner.on_action_chunk(chunk_name, move |chunk| {
             let _ = callback.call1(&JsValue::NULL, &action_chunk_to_js(chunk));
         });
     }
 
+    #[wasm_bindgen(js_name = "onVideoFrame")]
     pub fn on_video_frame(&self, track_name: &str, callback: js_sys::Function) {
         self.inner.on_video_frame(track_name, move |track_name, frame| {
             let _ = callback.call2(
@@ -548,6 +583,7 @@ impl WasmPortal {
         });
     }
 
+    #[wasm_bindgen(js_name = "onDrop")]
     pub fn on_drop(&self, callback: js_sys::Function) {
         self.inner.on_drop(move |dropped| {
             let arr = js_sys::Array::new();
@@ -562,6 +598,18 @@ impl WasmPortal {
 
 fn js_error_from_portal(error: livekit_portal_core::error::PortalError) -> wasm_bindgen::JsError {
     js_error(error.to_string())
+}
+
+/// RPC failures reject with `{code, message, data}` semantics: a JS `Error`
+/// whose message renders the error, with `code` and `data` attached as
+/// properties so callers can branch on the code (livekit-js's own
+/// `RpcError` rejects the same way). Returned as a raw `JsValue` — the
+/// exported `performRpc` maps rejections straight onto it.
+fn rpc_error_to_js_error(error: livekit_portal_core::rpc::RpcError) -> JsValue {
+    let err = js_sys::Error::new(&error.to_string());
+    let _ = js_sys::Reflect::set(&err, &"code".into(), &error.code.into());
+    let _ = js_sys::Reflect::set(&err, &"data".into(), &error.data.clone().into());
+    err.into()
 }
 
 fn js_error_to_rpc(value: JsValue) -> RpcError {

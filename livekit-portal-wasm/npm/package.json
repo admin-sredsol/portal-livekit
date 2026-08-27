@@ -1,0 +1,33 @@
+{
+  "name": "livekit-portal-wasm",
+  "version": "0.2.5",
+  "description": "LiveKit Portal protocol core compiled to WebAssembly, with the LiveKitJsTransport browser transport. Robot teleop state/action/video sync over LiveKit rooms from any JS runtime.",
+  "license": "Apache-2.0",
+  "main": "./dist/node/livekit_portal_wasm.js",
+  "module": "./dist/web/livekit_portal_wasm.js",
+  "browser": "./dist/web/livekit_portal_wasm.js",
+  "types": "./dist/web/livekit_portal_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/web/livekit_portal_wasm.d.ts",
+      "browser": "./dist/web/livekit_portal_wasm.js",
+      "node": "./dist/node/livekit_portal_wasm.js",
+      "default": "./dist/web/livekit_portal_wasm.js"
+    },
+    "./transport": "./dist/transport/livekit-js-transport.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/smoke.mjs",
+    "typecheck": "tsc --noEmit -p ../ts/tsconfig.json"
+  },
+  "dependencies": {
+    "livekit-client": "^2.15.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

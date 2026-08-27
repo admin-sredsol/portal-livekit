@@ -18,13 +18,21 @@
 /// outgoing state / actions / chunks / frames when the caller doesn't supply
 /// one.
 ///
-/// Uses `std::time::SystemTime`, which compiles on `wasm32` but does not
-/// advance there — browsers pass explicit `timestamp_us` values (every send
-/// API takes one) or back the clock via a transport-level shim in a future
-/// wasm entry point.
+/// Native uses `std::time::SystemTime`. On `wasm32` `SystemTime::now()`
+/// panics ("time not implemented on this platform"), so the clock is
+/// `js_sys::Date::now()` — the same Unix-epoch wall clock at millisecond
+/// resolution. Callers needing higher precision pass explicit `timestamp_us`
+/// values (every send API takes one), typically from
+/// `performance.timeOrigin + performance.now()` on the JS side.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn now_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn now_us() -> u64 {
+    (js_sys::Date::now() * 1000.0) as u64
 }

@@ -267,15 +267,18 @@ impl PortalTransport for JsTransportAdapter {
         &self,
         attrs: HashMap<String, String>,
     ) -> TransportFuture<PortalResult<()>> {
-        let value = match serde_wasm_bindgen::to_value(&attrs) {
-            Ok(v) => v,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(PortalError::Room(format!(
-                    "attribute serialization failed: {e}"
-                )))));
-            }
-        };
-        let promise = self.inner.js_set_attributes(value);
+        // Plain object, not serde: serde-wasm-bindgen serializes HashMap as
+        // a JS Map, but the contract documents `{[k: string]: string}` —
+        // and livekit-js's setAttributes takes a Record.
+        let obj = js_sys::Object::new();
+        for (key, value) in &attrs {
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str(key),
+                &JsValue::from_str(value),
+            );
+        }
+        let promise = self.inner.js_set_attributes(obj.into());
         Box::pin(js_unit(promise))
     }
 

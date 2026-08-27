@@ -42,3 +42,6 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros",
 # Drives core's internal tasks (publisher drainers, RTT service, event loop)
 # on the JS event loop; natively those are tokio::spawn tasks (see task.rs).
 wasm-bindgen-futures = "0.4"
+# The wasm32 clock: `SystemTime::now()` panics on wasm32-unknown-unknown,
+# so `time::now_us` reads `Date.now()` instead (see time.rs).
+js-sys = "0.3"
