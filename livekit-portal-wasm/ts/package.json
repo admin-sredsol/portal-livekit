@@ -1,0 +1,17 @@
+{
+  "name": "livekit-portal-wasm-ts",
+  "version": "0.2.5",
+  "private": true,
+  "description": "Browser transport for livekit-portal-wasm: LiveKitJsTransport over livekit-client (Phase 3 of WASM_PORT_PLAN.md; npm packaging lands in Phase 4)",
+  "type": "module",
+  "main": "livekit-js-transport.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "livekit-client": "^2.15.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

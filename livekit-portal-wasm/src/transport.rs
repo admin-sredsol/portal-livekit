@@ -75,9 +75,10 @@ extern "C" {
     pub type JsTransportObject;
 
     /// Establish the room connection. `connectInfo` is
-    /// `{url, token, byteStreamTopics: string[], events: PortalEventSink}`.
-    /// The sink is bound before the promise resolves: events that fire
-    /// during connect (self-join, early participants) are not lost.
+    /// `{url, token, byteStreamTopics: string[]}`; the event sink arrives
+    /// separately via [`JsTransportObject::js_bind_event_sink`], always
+    /// before this call. Events that fire during connect (self-join, early
+    /// participants) are therefore not lost.
     #[wasm_bindgen(method, js_name = connect)]
     fn js_connect(this: &JsTransportObject, connect_info: JsValue) -> Promise;
 

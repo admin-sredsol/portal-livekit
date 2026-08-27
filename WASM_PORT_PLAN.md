@@ -3,7 +3,8 @@
 Assessment of this fork (clean clone of livekit/portal @ `999c118`) for compiling the Rust
 core to WebAssembly and making Portal usable from a browser operator UI.
 
-> **Status (updated after Phase 2).** Phases 0, 1, and 2 are **done**.
+> **Status (updated after Phase 3).** Phases 0–3 are **done**; Phase 4
+> (packaging & CI) remains.
 >
 > - *Phases 0–1* moved the protocol core into `livekit-portal-core` with the native
 >   `LiveKitRustTransport` inside it behind a `native` cargo feature; the parent
@@ -25,8 +26,15 @@ core to WebAssembly and making Portal usable from a browser operator UI.
 >   `--features native` (incl. 6 new `ingest_video_frame` tests on a `FakeTransport`);
 >   `cargo check` + `cargo clippy` for `livekit-portal-core` +
 >   `livekit-portal-wasm` on `wasm32-unknown-unknown` clean.
-> - Next: Phase 3 — the TypeScript `LiveKitJsTransport` implementing the `JsTransport`
->   contract over livekit-js, then Phase 4 packaging.
+> - *Phase 3* added `livekit-portal-wasm/ts/livekit-js-transport.ts` — the
+>   reference `LiveKitJsTransport` implementing the `JsTransport` contract over
+>   livekit-js: byte streams via per-topic `registerByteStreamHandler`, RPC via
+>   `room.registerRpcMethod` (rejections carry `RpcError`'s
+>   `{code, message, data}`), canvas-capture publishing for WebRTC video,
+>   and embedder-driven decode into `ingestVideoFrame` on the receive side.
+> - Verified: `tsc --noEmit` strict against livekit-client's own type
+>   declarations (TS 5.9); wasm crate doc-only change after.
+> - Next: Phase 4 — packaging & CI.
 
 ## 1. Verdict
 
@@ -170,14 +178,25 @@ timer abstraction (native impl = tokio; wasm impl = futures-timer/gloo).
 hand-built JS conversions instead of tsify; callbacks registered as `js_sys::Function`
 closures; `PortalEventSink` carries inbound events + RPC dispatch to JS).
 
-**Phase 3 — TS transport adapter (few hundred lines).**
-`LiveKitJsTransport implements PortalTransport` over livekit-js:
-`publishData` (with reliability + destination_identities), `streamText`/byte-stream
-options, `performRpc`, participant attributes + the five event hooks Portal needs.
-Video: on send, camera frames go straight out as a livekit-js track (or frame-video
-path: `canvas.toBlob` PNG/JPEG → wasm chunker); on receive, `<video>`/canvas →
-`VideoFrameData` bytes → wasm SyncBuffer. No libyuv anywhere — the browser handles
-I420 inside its WebRTC pipeline.
+**Phase 3 — TS transport adapter (few hundred lines). ✅ Done**
+(`livekit-portal-wasm/ts/livekit-js-transport.ts`; typechecks against
+livekit-client's own types, strict). `LiveKitJsTransport implements JsTransport`
+over livekit-js: `publishData` (reliability + topic), `sendBytes` on declared
+byte-stream topics via `room.registerByteStreamHandler` (one finished stream =
+one payload, accumulated chunks concatenated), `performRpc` (rejects carry
+livekit's `RpcError` — same `{code, message, data}` shape the Rust adapter
+reads), inbound RPC via `room.registerRpcMethod` wrapping
+`sink.invokeRpcMethod`, `setAttributes`, and the event hooks Portal needs.
+Video: on send, a lazily published canvas-backed track per track name
+(`captureStream(0)` + `requestFrame` per frame, sender timestamp ignored —
+WebRTC stamps its own clock); on receive, the transport records subscribed
+tracks and the embedder decodes into `WasmPortal.ingestVideoFrame`. No libyuv
+anywhere — the browser handles I420 inside its WebRTC pipeline. Two subtleties
+worth knowing: RPC handlers registered before `connect` (and Portal's
+reconnect re-application) are buffered/de-duplicated because livekit throws
+on duplicate registration; and `startVideoReceiver` must NOT re-notify the
+sink — core already dispatched the `VideoTrackSubscribed` event before
+calling it, so a re-notify would loop the event channel.
 
 **Phase 4 — packaging & CI.**
 `wasm-pack` → npm package (ESM, web target); GitHub Actions job adding
