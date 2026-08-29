@@ -28,14 +28,15 @@
  *
  * Requires: rustup toolchain from rust-toolchain.toml, the
  * `wasm32-unknown-unknown` target, `wasm-bindgen-cli` at the same version as
- * the crate's `wasm-bindgen` dependency (0.2.127 — the CLI and crate must
- * match exactly), and npm installs in BOTH this directory (provides the
- * `tsc` binary) and `../ts/` (provides the `livekit-client` types the
- * adapter source resolves against).
+ * the crate's `wasm-bindgen` dependency (read from Cargo.lock — the CLI and
+ * crate must match exactly), and npm installs in BOTH this directory
+ * (provides the `tsc` binary) and `../ts/` (provides the `livekit-client`
+ * types the adapter source resolves against). Step 0 preflights the Rust
+ * pieces and prints the exact fix command when one is missing.
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +50,54 @@ function run(cmd, args, opts = {}) {
   if (result.status !== 0) {
     throw new Error(`${cmd} ${args.join(" ")} failed with status ${result.status}`);
   }
+}
+
+function fail(message) {
+  console.error(`\n${message}\n`);
+  process.exit(1);
+}
+
+// 0. Preflight: the two toolchain pieces this script cannot install itself.
+// Fail with the exact fix instead of a wall of E0463 from rustc.
+const WASM_TARGET = "wasm32-unknown-unknown";
+
+const rustup = spawnSync("rustup", ["target", "list", "--installed"], { encoding: "utf8" });
+if (rustup.status !== 0) {
+  fail(
+    "rustup is not available, or the toolchain pinned in rust-toolchain.toml " +
+      "(1.97.1) is not installed. Install Rust via https://rustup.rs, then from " +
+      "the repo root run:\n" +
+      "  rustup target add wasm32-unknown-unknown\n" +
+      "(rustup installs the pinned toolchain first, if needed)",
+  );
+}
+if (!rustup.stdout.split(/\s+/).includes(WASM_TARGET)) {
+  fail(
+    `The ${WASM_TARGET} rustup target is not installed (rustc would fail with E0463). Fix:\n` +
+      "  rustup target add wasm32-unknown-unknown",
+  );
+}
+
+// The CLI version must equal the crate's wasm-bindgen dependency version
+// exactly — read it from Cargo.lock rather than hardcoding (same recipe CI
+// uses), so a lockfile bump surfaces as a clear instruction here too.
+const lock = readFileSync(join(repoRoot, "Cargo.lock"), "utf8");
+const lockMatch = lock.match(/^name = "wasm-bindgen"$\n^version = "([^"]+)"/m);
+const wbgVersion = lockMatch ? lockMatch[1] : null;
+const bindgen = spawnSync("wasm-bindgen", ["--version"], { encoding: "utf8" });
+if (bindgen.status !== 0 || !/wasm-bindgen (\d+\.\d+\.\d+)/.test(bindgen.stdout)) {
+  fail(
+    "wasm-bindgen-cli not found. Install it (version locked to Cargo.lock):\n" +
+      `  cargo install wasm-bindgen-cli --version ${wbgVersion ?? "0.2.127"} --locked`,
+  );
+}
+const cliVersion = bindgen.stdout.match(/wasm-bindgen (\d+\.\d+\.\d+)/)[1];
+if (wbgVersion && cliVersion !== wbgVersion) {
+  fail(
+    `wasm-bindgen CLI (${cliVersion}) does not match the crate's wasm-bindgen ` +
+      `dependency (${wbgVersion}) — wasm-bindgen refuses mismatched pairs. Fix:\n` +
+      `  cargo install wasm-bindgen-cli --version ${wbgVersion} --locked --force`,
+  );
 }
 
 // 1. Release cdylib for wasm32. The crate's non-wasm deps compile to empty
